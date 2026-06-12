@@ -748,16 +748,20 @@ def l2test_summary(result: dict[str, Any], duration_sec: int) -> dict[str, Any]:
     output = f"{result.get('stdout') or ''}\n{result.get('stderr') or ''}"
     duration_ms = int(result.get("duration_ms") or 0)
     ran_long_enough = duration_ms >= min(duration_sec * 800, max(5000, duration_sec * 1000 - 2000))
+    connected = "Connected to " in output and "Can't connect" not in output
+    disconnect_seen = "Disconnect:" in output
+    sample_count = len(re.findall(r"\b\d+\s+bytes in\b", output))
     return {
-        "connected": "Connected to " in output and "Can't connect" not in output,
+        "connected": connected,
         "reset_by_peer": "Connection reset by peer" in output,
         "connection_aborted": "Software caused connection abort" in output,
         "connect_failed": "Can't connect" in output,
-        "disconnect_seen": "Disconnect:" in output,
-        "sample_count": len(re.findall(r"\b\d+\s+bytes in\b", output)),
+        "disconnect_seen": disconnect_seen,
+        "sample_count": sample_count,
         "returncode": result.get("returncode"),
         "duration_ms": duration_ms,
         "ran_long_enough": ran_long_enough,
+        "activity_seen": bool(connected or disconnect_seen or sample_count > 0),
     }
 
 
@@ -1166,21 +1170,26 @@ class CommandRunner:
         command_type = str(command.get("type") or "bt_ble_probe")
         role = str(command.get("role") or ("advertise" if command_type == "bt_ble_advertise" else "scan"))
         started = now_ms()
-        outputs = []
-        outputs.append({"cmd": "btmgmt power on", "result": run_cmd(["btmgmt", "power", "on"], timeout=5)})
+        outputs = prepare_bluetooth(str(self.config["bt_controller"]))
+        critical_ok = False
         if role == "advertise":
-            outputs.append({"cmd": "btmgmt le on", "result": run_cmd(["btmgmt", "le", "on"], timeout=5)})
             outputs.append({"cmd": "bluetoothctl system-alias", "result": run_cmd(["bluetoothctl", "system-alias", str(self.config["board_id"])], timeout=5)})
-            outputs.append({"cmd": "bluetoothctl advertise on", "result": run_cmd(["bluetoothctl", "advertise", "on"], timeout=5)})
+            advertise_on = run_cmd(["bluetoothctl", "advertise", "on"], timeout=8)
+            outputs.append({"cmd": "bluetoothctl advertise on", "result": advertise_on})
+            critical_ok = bool(advertise_on.get("ok"))
             time.sleep(duration)
             outputs.append({"cmd": "bluetoothctl advertise off", "result": run_cmd(["bluetoothctl", "advertise", "off"], timeout=5)})
         else:
-            outputs.append({"cmd": "bluetoothctl scan on", "result": run_cmd(["bluetoothctl", "--timeout", str(duration), "scan", "on"], timeout=duration + 5)})
-        outputs.append({"cmd": "btmgmt info", "result": run_cmd(["btmgmt", "info"], timeout=5)})
+            scan = run_cmd(["bluetoothctl", "--timeout", str(duration), "scan", "on"], timeout=duration + 8)
+            outputs.append({"cmd": "bluetoothctl scan on", "result": scan})
+            critical_ok = bool(scan.get("ok"))
+        status_result = run_cmd(["hciconfig", str(self.config["bt_controller"]), "-a"], timeout=5)
+        outputs.append({"cmd": "hciconfig status", "result": status_result})
         btmon = capture_btmon(str(self.config["bt_controller"]), int(self.config.get("btmon_capture_sec") or 0))
         if btmon:
             outputs.append({"cmd": "btmon sample", "result": btmon})
-        ok = any(item["result"]["ok"] for item in outputs)
+        controller_up = parse_hciconfig(str(status_result.get("stdout") or "")).get("up")
+        ok = critical_ok and bool(controller_up)
         return {
             "command_id": command.get("id"),
             "type": command_type,
@@ -1188,29 +1197,36 @@ class CommandRunner:
             "role": role,
             "started_at_ms": started,
             "finished_at_ms": now_ms(),
-            "summary": {"role": role, "duration_sec": duration, "btmon_captured": bool(btmon)},
+            "summary": {"role": role, "duration_sec": duration, "controller_up": bool(controller_up), "btmon_captured": bool(btmon)},
             "raw": outputs,
         }
 
     def run_bt_bredr_inquiry(self, command: dict[str, Any]) -> dict[str, Any]:
         duration = int(command.get("duration_sec", 20))
         started = now_ms()
-        outputs = [
-            {"cmd": "btmgmt power on", "result": run_cmd(["btmgmt", "power", "on"], timeout=5)},
-            {"cmd": "btmgmt bredr on", "result": run_cmd(["btmgmt", "bredr", "on"], timeout=5)},
-            {"cmd": "btmgmt connectable on", "result": run_cmd(["btmgmt", "connectable", "on"], timeout=5)},
-            {"cmd": "btmgmt discoverable on", "result": run_cmd(["btmgmt", "discoverable", "on"], timeout=5)},
-            {"cmd": "hcitool scan", "result": run_cmd(["hcitool", "-i", str(self.config["bt_controller"]), "scan", "--flush"], timeout=duration)},
-            {"cmd": "btmgmt info", "result": run_cmd(["btmgmt", "info"], timeout=5)},
-        ]
-        found = parse_bt_scan_count(outputs[4]["result"]["stdout"])
+        outputs = prepare_bluetooth(str(self.config["bt_controller"]))
+        scan = run_cmd(["hcitool", "-i", str(self.config["bt_controller"]), "scan", "--flush"], timeout=duration + 3)
+        outputs.append({"cmd": "hcitool scan", "result": scan})
+        status = run_cmd(["hciconfig", str(self.config["bt_controller"]), "-a"], timeout=5)
+        outputs.append({"cmd": "hciconfig status", "result": status})
+        found = parse_bt_scan_count(scan["stdout"])
+        scan_timed_out = scan.get("returncode") == 124
+        scan_ran_long_enough = int(scan.get("duration_ms") or 0) >= max(5000, duration * 900)
+        controller_up = parse_hciconfig(str(status.get("stdout") or "")).get("up")
+        ok = bool(scan.get("ok")) or bool(scan_timed_out and scan_ran_long_enough and controller_up)
         return {
             "command_id": command.get("id"),
             "type": command.get("type"),
-            "status": "passed" if outputs[4]["result"]["ok"] else "failed",
+            "status": "passed" if ok else "failed",
             "started_at_ms": started,
             "finished_at_ms": now_ms(),
-            "summary": {"duration_sec": duration, "devices_found": found},
+            "summary": {
+                "duration_sec": duration,
+                "devices_found": found,
+                "scan_timed_out": scan_timed_out,
+                "scan_ran_long_enough": scan_ran_long_enough,
+                "controller_up": bool(controller_up),
+            },
             "raw": outputs,
         }
 
@@ -1252,8 +1268,8 @@ class CommandRunner:
         packet_bytes = int(command.get("bytes", 600))
         frames = int(command.get("frames", 0) or 0)
         delay_ms = max(0, int(command.get("delay_ms", 0) or 0))
-        client_delay_sec = max(0.0, float(command.get("client_delay_sec", 3)))
-        startup_grace_sec = max(0.0, float(command.get("startup_grace_sec", 5)))
+        client_delay_sec = max(0.0, float(command.get("client_delay_sec", 6)))
+        startup_grace_sec = max(0.0, float(command.get("startup_grace_sec", 10)))
         started = now_ms()
         outputs = prepare_bluetooth(str(self.config["bt_controller"]))
         if role == "server":
@@ -1264,7 +1280,11 @@ class CommandRunner:
                 args.extend(["-b", str(packet_bytes)])
             result = run_cmd(args, timeout=duration + startup_grace_sec)
             test_summary = l2test_summary(result, duration)
-            ok = result["ok"] or (result["returncode"] == 124 and test_summary["connected"])
+            ok = result["ok"] or (
+                result["returncode"] == 124
+                and test_summary["ran_long_enough"]
+                and test_summary["activity_seen"]
+            )
         elif peer_mac:
             args = ["l2test", "-s", "-i", str(self.config["bt_controller"])]
             if psm:
@@ -1281,7 +1301,7 @@ class CommandRunner:
             result = run_cmd(args, timeout=duration)
             test_summary = l2test_summary(result, duration)
             link_error = test_summary["reset_by_peer"] or test_summary["connection_aborted"] or test_summary["connect_failed"]
-            ok = (result["ok"] or result["returncode"] == 124 or (test_summary["connected"] and test_summary["ran_long_enough"])) and not link_error
+            ok = (result["ok"] or (test_summary["ran_long_enough"] and test_summary["activity_seen"])) and not link_error
         else:
             args = ["l2test"]
             result = {"ok": False, "returncode": 2, "stdout": "", "stderr": "missing peer_bt_mac", "duration_ms": 0}

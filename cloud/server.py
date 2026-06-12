@@ -48,6 +48,8 @@ class Settings:
     bt_l2test_frames = int(os.environ.get("BURNIN_BT_L2TEST_FRAMES", "1000000"))
     bt_l2test_bytes = int(os.environ.get("BURNIN_BT_L2TEST_BYTES", "600"))
     bt_l2test_delay_ms = int(os.environ.get("BURNIN_BT_L2TEST_DELAY_MS", "20"))
+    bt_l2test_client_delay_sec = float(os.environ.get("BURNIN_BT_L2TEST_CLIENT_DELAY_SEC", "6"))
+    bt_l2test_startup_grace_sec = float(os.environ.get("BURNIN_BT_L2TEST_STARTUP_GRACE_SEC", "10"))
     bt_l2test_psm = os.environ.get("BURNIN_BT_L2TEST_PSM", "").strip()
     dashboard_path = "/" + os.environ.get("BURNIN_DASHBOARD_PATH", "/tspi-burnin").strip("/")
     test_start_ms = int(os.environ.get("BURNIN_TEST_START_MS", "0") or "0")
@@ -167,7 +169,12 @@ def dashboard_result(item: dict[str, Any]) -> dict[str, Any]:
         "returncode",
         "duration_ms",
         "ran_long_enough",
+        "activity_seen",
         "btmon_captured",
+        "devices_found",
+        "scan_timed_out",
+        "scan_ran_long_enough",
+        "controller_up",
         "stdout_lines",
         "stderr_lines",
     )
@@ -1892,6 +1899,8 @@ def bt_commands_for_epoch(board_id: str, epoch: int, index: int, board_count: in
             "bytes": settings.bt_l2test_bytes,
             "frames": settings.bt_l2test_frames,
             "delay_ms": settings.bt_l2test_delay_ms,
+            "client_delay_sec": settings.bt_l2test_client_delay_sec,
+            "startup_grace_sec": settings.bt_l2test_startup_grace_sec,
         }
         if settings.bt_l2test_psm:
             command["psm"] = settings.bt_l2test_psm
