@@ -1172,17 +1172,19 @@ class CommandRunner:
         started = now_ms()
         outputs = prepare_bluetooth(str(self.config["bt_controller"]))
         critical_ok = False
+        ran_long_enough = False
         if role == "advertise":
             outputs.append({"cmd": "bluetoothctl system-alias", "result": run_cmd(["bluetoothctl", "system-alias", str(self.config["board_id"])], timeout=5)})
-            advertise_on = run_cmd(["bluetoothctl", "advertise", "on"], timeout=8)
+            advertise_on = run_cmd(["bluetoothctl", "--timeout", str(duration), "advertise", "on"], timeout=duration + 8)
             outputs.append({"cmd": "bluetoothctl advertise on", "result": advertise_on})
-            critical_ok = bool(advertise_on.get("ok"))
-            time.sleep(duration)
+            ran_long_enough = int(advertise_on.get("duration_ms") or 0) >= max(5000, duration * 900)
+            critical_ok = bool(advertise_on.get("ok")) or bool(advertise_on.get("returncode") == 124 and ran_long_enough)
             outputs.append({"cmd": "bluetoothctl advertise off", "result": run_cmd(["bluetoothctl", "advertise", "off"], timeout=5)})
         else:
             scan = run_cmd(["bluetoothctl", "--timeout", str(duration), "scan", "on"], timeout=duration + 8)
             outputs.append({"cmd": "bluetoothctl scan on", "result": scan})
-            critical_ok = bool(scan.get("ok"))
+            ran_long_enough = int(scan.get("duration_ms") or 0) >= max(5000, duration * 900)
+            critical_ok = bool(scan.get("ok")) or bool(scan.get("returncode") == 124 and ran_long_enough)
         status_result = run_cmd(["hciconfig", str(self.config["bt_controller"]), "-a"], timeout=5)
         outputs.append({"cmd": "hciconfig status", "result": status_result})
         btmon = capture_btmon(str(self.config["bt_controller"]), int(self.config.get("btmon_capture_sec") or 0))
@@ -1197,7 +1199,13 @@ class CommandRunner:
             "role": role,
             "started_at_ms": started,
             "finished_at_ms": now_ms(),
-            "summary": {"role": role, "duration_sec": duration, "controller_up": bool(controller_up), "btmon_captured": bool(btmon)},
+            "summary": {
+                "role": role,
+                "duration_sec": duration,
+                "controller_up": bool(controller_up),
+                "ran_long_enough": ran_long_enough,
+                "btmon_captured": bool(btmon),
+            },
             "raw": outputs,
         }
 
