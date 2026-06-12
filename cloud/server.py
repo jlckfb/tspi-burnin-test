@@ -52,7 +52,8 @@ class Settings:
     dashboard_path = "/" + os.environ.get("BURNIN_DASHBOARD_PATH", "/tspi-burnin").strip("/")
     test_start_ms = int(os.environ.get("BURNIN_TEST_START_MS", "0") or "0")
     test_duration_sec = int(os.environ.get("BURNIN_TEST_DURATION_SEC", str(7 * 24 * 3600)))
-    metrics_retain_hours = int(os.environ.get("BURNIN_METRICS_RETAIN_HOURS", "24"))
+    metrics_retain_hours = int(os.environ.get("BURNIN_METRICS_RETAIN_HOURS", "168"))
+    events_retain_hours = int(os.environ.get("BURNIN_EVENTS_RETAIN_HOURS", "168"))
     public_dashboard_path = "/" + os.environ.get("BURNIN_PUBLIC_DASHBOARD_PATH", "/tspi-burnin-view").strip("/")
 
 
@@ -75,8 +76,52 @@ def dashboard_log(item: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def compact_event_data(data: dict[str, Any]) -> dict[str, Any]:
+    compact: dict[str, Any] = {}
+    for key in ("resource", "runtime_sec", "status", "failure_category", "failure_reason", "incident_id", "category"):
+        if key in data:
+            compact[key] = data.get(key)
+    command = data.get("command")
+    if isinstance(command, dict):
+        compact["command"] = {
+            key: command.get(key)
+            for key in ("id", "type", "peer_board_id", "peer_ip", "peer_bt_mac")
+            if key in command
+        }
+    result = data.get("result")
+    if isinstance(result, dict):
+        compact["result"] = {
+            key: result.get(key)
+            for key in ("command_id", "type", "status", "failure_category", "failure_reason")
+            if key in result
+        }
+    if "snapshot" in data:
+        compact["snapshot_available"] = True
+    if "journals" in data:
+        compact["journals_available"] = True
+    if "dmesg_tail" in data:
+        compact["dmesg_available"] = True
+    return compact
+
+
+def event_view(item: dict[str, Any], include_data: bool = True) -> dict[str, Any]:
+    data = item.get("data") if isinstance(item.get("data"), dict) else {}
+    return {
+        "timestamp_ms": item.get("timestamp_ms"),
+        "board_id": item.get("board_id"),
+        "boot_id": item.get("boot_id"),
+        "event_type": item.get("event_type"),
+        "command_id": item.get("command_id"),
+        "severity": item.get("severity") or "info",
+        "message": truncate_text(item.get("message") or data.get("message") or failure_reason(item), 260),
+        "data": data if include_data else compact_event_data(data),
+    }
+
+
 def dashboard_result(item: dict[str, Any]) -> dict[str, Any]:
     summary = item.get("summary") or {}
+    failed = item.get("status") != "passed"
+    failure = failure_details(item) if failed else {}
     keep_summary_keys = (
         "sent_bits_per_second",
         "received_bits_per_second",
@@ -102,6 +147,8 @@ def dashboard_result(item: dict[str, Any]) -> dict[str, Any]:
         "adaptive_max_loss_percent",
         "adaptive_probe_count",
         "adaptive_probe_summary",
+        "udp_max_loss_percent",
+        "udp_loss_exceeded",
         "role",
         "peer_bt_mac",
         "duration_sec",
@@ -138,15 +185,76 @@ def dashboard_result(item: dict[str, Any]) -> dict[str, Any]:
         "peer_board_id": item.get("peer_board_id") or summary.get("peer_board_id"),
         "local_wifi_ip": item.get("local_wifi_ip") or summary.get("local_wifi_ip"),
         "returncode": item.get("returncode"),
-        "error": truncate_text(item.get("error") or item.get("stderr"), 220),
+        "error": truncate_text((item.get("error") or item.get("stderr") or failure.get("reason")) if failed else "", 220),
+        "failure_reason": failure.get("reason"),
+        "failure_category": failure.get("category"),
+        "failed_command": failure.get("command"),
+        "stderr_excerpt": failure.get("stderr"),
         "summary": {key: summary.get(key) for key in keep_summary_keys if key in summary},
     }
+
+
+def failure_details(item: dict[str, Any]) -> dict[str, str]:
+    summary = item.get("summary") if isinstance(item.get("summary"), dict) else {}
+    raw = item.get("raw")
+    reason = item.get("failure_reason") or item.get("error") or item.get("stderr") or summary.get("error")
+    command = ""
+    stderr = ""
+    if isinstance(raw, dict):
+        reason = reason or raw.get("error") or (raw.get("end") or {}).get("error")
+        stderr = str(raw.get("stderr") or "")[-300:]
+    elif isinstance(raw, list):
+        for entry in raw:
+            if not isinstance(entry, dict):
+                continue
+            result = entry.get("result") if isinstance(entry.get("result"), dict) else {}
+            if result and not result.get("ok"):
+                command = str(entry.get("cmd") or "")
+                stderr = str(result.get("stderr") or result.get("stdout") or "")[-300:]
+                reason = reason or stderr or f"{command} failed"
+                break
+    if not reason and item.get("status") and item.get("status") != "passed":
+        reason = str(item.get("status"))
+    text = str(reason or "").strip()
+    category = classify_failure(item, text)
+    return {
+        "reason": truncate_text(text, 260),
+        "category": category,
+        "command": truncate_text(command, 160),
+        "stderr": truncate_text(stderr, 260),
+    }
+
+
+def failure_reason(item: dict[str, Any]) -> str:
+    return failure_details(item).get("reason") or ""
+
+
+def classify_failure(item: dict[str, Any], reason: str) -> str:
+    text = f"{item.get('type') or ''} {item.get('status') or ''} {reason}".lower()
+    summary = item.get("summary") if isinstance(item.get("summary"), dict) else {}
+    if summary.get("udp_loss_exceeded") or "udp loss" in text:
+        return "udp_loss"
+    if "lost_during_command" in text or "offline" in text:
+        return "board_offline"
+    if "server is busy" in text:
+        return "iperf3_busy"
+    if "connection reset" in text or "resource temporarily unavailable" in text:
+        return "iperf3_control"
+    if "100.0" in text and item.get("type") == "wifi_ping":
+        return "wifi_loss"
+    if "btmgmt" in text or "hcitool" in text or "timeout" in text and str(item.get("type") or "").startswith("bt_"):
+        return "bt_mgmt_timeout"
+    if "host is down" in text or "can't connect" in text:
+        return "bt_link_down"
+    if item.get("status") == "agent_error":
+        return "agent_error"
+    return "test_failed" if item.get("status") and item.get("status") != "passed" else ""
 
 
 class Store:
     def __init__(self, path: Path) -> None:
         self.path = path
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()
         self.conn = sqlite3.connect(str(path), check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA journal_mode=WAL")
@@ -214,6 +322,33 @@ class Store:
                     key TEXT PRIMARY KEY,
                     value_json TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    board_id TEXT NOT NULL,
+                    boot_id TEXT,
+                    timestamp_ms INTEGER NOT NULL,
+                    event_type TEXT NOT NULL,
+                    command_id TEXT,
+                    severity TEXT NOT NULL DEFAULT 'info',
+                    message TEXT,
+                    data_json TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_events_board_ts ON events(board_id, timestamp_ms);
+                CREATE INDEX IF NOT EXISTS idx_events_command_ts ON events(command_id, timestamp_ms);
+                CREATE INDEX IF NOT EXISTS idx_events_type_ts ON events(event_type, timestamp_ms);
+                CREATE TABLE IF NOT EXISTS incidents (
+                    incident_id TEXT PRIMARY KEY,
+                    board_id TEXT NOT NULL,
+                    boot_id TEXT,
+                    started_at_ms INTEGER NOT NULL,
+                    ended_at_ms INTEGER,
+                    status TEXT NOT NULL,
+                    category TEXT NOT NULL,
+                    last_command_id TEXT,
+                    summary_json TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_incidents_board_status ON incidents(board_id, status, started_at_ms);
+                CREATE INDEX IF NOT EXISTS idx_incidents_status_ts ON incidents(status, started_at_ms);
                 """
             )
 
@@ -280,14 +415,49 @@ class Store:
         with self.lock, self.conn:
             self.conn.executemany("INSERT INTO logs(board_id, boot_id, seq, timestamp_ms, level, message, data_json) VALUES(?,?,?,?,?,?,?)", rows)
 
+    def insert_events(self, events: list[dict[str, Any]]) -> int:
+        rows = []
+        for item in events:
+            board_id = require_board_id(item)
+            ts = int(item.get("timestamp_ms") or now_ms())
+            event_type = str(item.get("event_type") or item.get("type") or "event").strip() or "event"
+            data = item.get("data") if isinstance(item.get("data"), dict) else {}
+            rows.append(
+                (
+                    board_id,
+                    item.get("boot_id"),
+                    ts,
+                    event_type,
+                    item.get("command_id") or data.get("command_id"),
+                    str(item.get("severity") or data.get("severity") or "info"),
+                    truncate_text(item.get("message") or data.get("message") or "", 500),
+                    dump_json(item),
+                )
+            )
+        if rows:
+            with self.lock, self.conn:
+                self.conn.executemany(
+                    """
+                    INSERT INTO events(board_id, boot_id, timestamp_ms, event_type, command_id, severity, message, data_json)
+                    VALUES(?,?,?,?,?,?,?,?)
+                    """,
+                    rows,
+                )
+        return len(rows)
+
     def insert_results(self, payload: dict[str, Any]) -> None:
         board_id = payload.get("board_id")
         boot_id = payload.get("boot_id")
         rows = []
+        events = []
         for item in payload.get("results", []):
             item.setdefault("board_id", board_id)
             item.setdefault("boot_id", boot_id)
             item.setdefault("timestamp_ms", item.get("finished_at_ms") or now_ms())
+            details = failure_details(item)
+            if item.get("status") != "passed":
+                item.setdefault("failure_reason", details.get("reason"))
+                item.setdefault("failure_category", details.get("category"))
             rows.append(
                 (
                     require_board_id(item),
@@ -299,8 +469,26 @@ class Store:
                     dump_json(item),
                 )
             )
+            events.append(
+                {
+                    "board_id": item.get("board_id"),
+                    "boot_id": item.get("boot_id"),
+                    "timestamp_ms": item.get("timestamp_ms"),
+                    "event_type": "command_finished",
+                    "command_id": item.get("command_id"),
+                    "severity": "error" if item.get("status") not in {"passed", "unsupported"} else "info",
+                    "message": details.get("reason") if item.get("status") != "passed" else "command finished",
+                    "data": {
+                        "result": dashboard_result(item),
+                        "status": item.get("status"),
+                        "failure_category": details.get("category"),
+                        "failure_reason": details.get("reason"),
+                    },
+                }
+            )
         with self.lock, self.conn:
             self.conn.executemany("INSERT INTO results(board_id, boot_id, command_id, type, status, timestamp_ms, data_json) VALUES(?,?,?,?,?,?,?)", rows)
+        self.insert_events(events)
 
     def insert_artifacts(self, payload: dict[str, Any]) -> int:
         board_id = require_board_id(payload)
@@ -329,6 +517,12 @@ class Store:
             cursor = self.conn.execute("DELETE FROM metrics WHERE timestamp_ms < ?", (cutoff,))
             return cursor.rowcount
 
+    def purge_old_events(self) -> int:
+        cutoff = now_ms() - settings.events_retain_hours * 3600 * 1000
+        with self.lock, self.conn:
+            cursor = self.conn.execute("DELETE FROM events WHERE timestamp_ms < ?", (cutoff,))
+            return cursor.rowcount
+
     def clear_history(self, board_id: str | None = None) -> dict[str, int]:
         counts: dict[str, int] = {}
         params = (board_id,) if board_id else ()
@@ -338,7 +532,7 @@ class Store:
                 str(row["path"])
                 for row in self.conn.execute(f"SELECT path FROM artifacts{where}", params).fetchall()
             ]
-            for table in ("metrics", "logs", "results", "artifacts"):
+            for table in ("metrics", "logs", "results", "artifacts", "events", "incidents"):
                 cursor = self.conn.execute(f"DELETE FROM {table}{where}", params)
                 counts[table] = cursor.rowcount
         deleted_files = 0
@@ -402,6 +596,21 @@ class Store:
         else:
             status = "running"
             commands_enabled = True
+        wifi_epoch = int(time.time() // settings.wifi_epoch_sec) if settings.wifi_epoch_sec > 0 else 0
+        wifi_modes = []
+        for offset in range(8):
+            mode = wifi_mode_for_epoch(wifi_epoch + offset)
+            start = (wifi_epoch + offset) * settings.wifi_epoch_sec * 1000
+            wifi_modes.append(
+                {
+                    "epoch": wifi_epoch + offset,
+                    "type": mode.get("type"),
+                    "start_ms": start,
+                    "end_ms": start + settings.wifi_epoch_sec * 1000,
+                    "bandwidth": mode.get("bandwidth"),
+                    "adaptive_rates": mode.get("adaptive_rates"),
+                }
+            )
         return {
             "wifi_epoch_sec": settings.wifi_epoch_sec,
             "wifi_tcp_sec": settings.wifi_tcp_sec,
@@ -418,6 +627,8 @@ class Store:
             "test_progress_percent": test_progress_percent(start_ms, duration_sec),
             "status": status,
             "commands_enabled": commands_enabled,
+            "current_wifi_mode": wifi_modes[0] if wifi_modes else None,
+            "upcoming_wifi_modes": wifi_modes,
         }
 
     def trend_snapshot(self, hours: int = 24, max_points_per_board: int = 360) -> dict[str, Any]:
@@ -483,8 +694,430 @@ class Store:
                 board["last_heartbeat"] = {}
         return boards
 
+    def event_rows(self, rows: list[sqlite3.Row], include_data: bool = True) -> list[dict[str, Any]]:
+        items = []
+        for row in rows:
+            try:
+                item = json.loads(row["data_json"])
+            except Exception:
+                item = {
+                    "timestamp_ms": row["timestamp_ms"],
+                    "board_id": row["board_id"],
+                    "boot_id": row["boot_id"],
+                    "event_type": row["event_type"],
+                    "command_id": row["command_id"],
+                    "severity": row["severity"],
+                    "message": row["message"],
+                    "data": {},
+                }
+            items.append(event_view(item, include_data=include_data))
+        return items
+
+    def recent_events(
+        self,
+        board_id: str | None = None,
+        command_id: str | None = None,
+        event_type: str | None = None,
+        severity: str | None = None,
+        limit: int = 200,
+        since_ms: int | None = None,
+    ) -> list[dict[str, Any]]:
+        clauses = []
+        params: list[Any] = []
+        if board_id:
+            clauses.append("board_id=?")
+            params.append(board_id)
+        if command_id:
+            clauses.append("command_id=?")
+            params.append(command_id)
+        if event_type:
+            clauses.append("event_type=?")
+            params.append(event_type)
+        if severity:
+            clauses.append("severity=?")
+            params.append(severity)
+        if since_ms:
+            clauses.append("timestamp_ms>=?")
+            params.append(int(since_ms))
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        params.append(max(1, min(int(limit or 200), 2000)))
+        with self.lock:
+            rows = self.conn.execute(
+                f"SELECT * FROM events {where} ORDER BY timestamp_ms DESC, id DESC LIMIT ?",
+                params,
+            ).fetchall()
+        return list(reversed(self.event_rows(rows)))
+
+    def recent_logs(self, board_id: str | None = None, limit: int = 200, since_ms: int | None = None) -> list[dict[str, Any]]:
+        clauses = []
+        params: list[Any] = []
+        if board_id:
+            clauses.append("board_id=?")
+            params.append(board_id)
+        if since_ms:
+            clauses.append("timestamp_ms>=?")
+            params.append(int(since_ms))
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        params.append(max(1, min(int(limit or 200), 2000)))
+        with self.lock:
+            rows = self.conn.execute(
+                f"SELECT data_json FROM logs {where} ORDER BY timestamp_ms DESC, id DESC LIMIT ?",
+                params,
+            ).fetchall()
+        logs = []
+        for row in rows:
+            try:
+                logs.append(json.loads(row["data_json"]))
+            except Exception:
+                continue
+        return list(reversed(logs))
+
+    def recent_metrics(
+        self,
+        board_id: str | None = None,
+        limit: int = 200,
+        since_ms: int | None = None,
+        compact: bool = True,
+    ) -> list[dict[str, Any]]:
+        clauses = []
+        params: list[Any] = []
+        if board_id:
+            clauses.append("board_id=?")
+            params.append(board_id)
+        if since_ms:
+            clauses.append("timestamp_ms>=?")
+            params.append(int(since_ms))
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        params.append(max(1, min(int(limit or 200), 2000)))
+        with self.lock:
+            rows = self.conn.execute(
+                f"SELECT data_json FROM metrics {where} ORDER BY timestamp_ms DESC, id DESC LIMIT ?",
+                params,
+            ).fetchall()
+        metrics = []
+        for row in rows:
+            try:
+                metric = json.loads(row["data_json"])
+            except Exception:
+                continue
+            metrics.append(compact_metric(metric) if compact else metric)
+        return list(reversed(metrics))
+
+    def recent_failures(self, board_id: str | None = None, limit: int = 100, raw: bool = False) -> list[dict[str, Any]]:
+        clauses = ["COALESCE(status, 'unknown') != 'passed'"]
+        params: list[Any] = []
+        if board_id:
+            clauses.append("board_id=?")
+            params.append(board_id)
+        params.append(max(1, min(int(limit or 100), 1000)))
+        with self.lock:
+            rows = self.conn.execute(
+                f"""
+                SELECT data_json FROM results
+                WHERE {' AND '.join(clauses)}
+                ORDER BY timestamp_ms DESC, id DESC LIMIT ?
+                """,
+                params,
+            ).fetchall()
+        failures = []
+        for row in rows:
+            try:
+                item = json.loads(row["data_json"])
+            except Exception:
+                continue
+            failures.append(item if raw else dashboard_result(item))
+        return failures
+
+    def recent_incidents(self, board_id: str | None = None, limit: int = 50) -> list[dict[str, Any]]:
+        params: list[Any] = []
+        where = ""
+        if board_id:
+            where = "WHERE board_id=?"
+            params.append(board_id)
+        params.append(max(1, min(int(limit or 50), 500)))
+        with self.lock:
+            rows = self.conn.execute(
+                f"SELECT * FROM incidents {where} ORDER BY started_at_ms DESC LIMIT ?",
+                params,
+            ).fetchall()
+        incidents = []
+        for row in rows:
+            item = dict(row)
+            try:
+                item["summary"] = json.loads(item.pop("summary_json"))
+            except Exception:
+                item["summary"] = {}
+            incidents.append(item)
+        return incidents
+
+    def maintain_offline_incidents(self, boards: list[dict[str, Any]]) -> None:
+        now = now_ms()
+        with self.lock, self.conn:
+            for board in boards:
+                board_id = str(board["board_id"])
+                open_row = self.conn.execute(
+                    "SELECT * FROM incidents WHERE board_id=? AND status='open' ORDER BY started_at_ms DESC LIMIT 1",
+                    (board_id,),
+                ).fetchone()
+                if board.get("online"):
+                    if open_row:
+                        self.conn.execute(
+                            "UPDATE incidents SET status='closed', ended_at_ms=? WHERE incident_id=?",
+                            (now, open_row["incident_id"]),
+                        )
+                    continue
+                if open_row:
+                    continue
+                last_event_row = self.conn.execute(
+                    "SELECT * FROM events WHERE board_id=? ORDER BY timestamp_ms DESC, id DESC LIMIT 1",
+                    (board_id,),
+                ).fetchone()
+                last_command_row = self.conn.execute(
+                    """
+                    SELECT * FROM events
+                    WHERE board_id=? AND command_id IS NOT NULL
+                    ORDER BY timestamp_ms DESC, id DESC LIMIT 1
+                    """,
+                    (board_id,),
+                ).fetchone()
+                last_metric_row = self.conn.execute(
+                    "SELECT timestamp_ms, data_json FROM metrics WHERE board_id=? ORDER BY timestamp_ms DESC, id DESC LIMIT 1",
+                    (board_id,),
+                ).fetchone()
+                last_log_rows = self.conn.execute(
+                    "SELECT data_json FROM logs WHERE board_id=? ORDER BY timestamp_ms DESC, id DESC LIMIT 10",
+                    (board_id,),
+                ).fetchall()
+                last_result_row = self.conn.execute(
+                    "SELECT data_json FROM results WHERE board_id=? ORDER BY timestamp_ms DESC, id DESC LIMIT 1",
+                    (board_id,),
+                ).fetchone()
+                last_command = json.loads(last_command_row["data_json"]) if last_command_row else {}
+                last_event = json.loads(last_event_row["data_json"]) if last_event_row else {}
+                last_metric = json.loads(last_metric_row["data_json"]) if last_metric_row else {}
+                last_result = json.loads(last_result_row["data_json"]) if last_result_row else {}
+                last_logs = []
+                for row in last_log_rows:
+                    try:
+                        last_logs.append(dashboard_log(json.loads(row["data_json"])))
+                    except Exception:
+                        pass
+                last_command_type = str(last_command.get("event_type") or "")
+                category = "lost_during_command" if last_command.get("command_id") and last_command_type != "command_finished" else "board_offline"
+                incident_id = f"{board_id}-{int(board.get('last_seen_ms') or now)}"
+                summary = {
+                    "last_seen_ms": board.get("last_seen_ms"),
+                    "offline_detected_ms": now,
+                    "last_event": event_view(last_event) if last_event else None,
+                    "last_command": event_view(last_command) if last_command else None,
+                    "last_metric": compact_metric(last_metric),
+                    "last_result": dashboard_result(last_result) if last_result else None,
+                    "last_logs": last_logs,
+                }
+                self.conn.execute(
+                    """
+                    INSERT OR IGNORE INTO incidents(incident_id, board_id, boot_id, started_at_ms, ended_at_ms, status, category, last_command_id, summary_json)
+                    VALUES(?,?,?,?,?,?,?,?,?)
+                    """,
+                    (
+                        incident_id,
+                        board_id,
+                        board.get("boot_id"),
+                        int(board.get("last_seen_ms") or now),
+                        None,
+                        "open",
+                        category,
+                        last_command.get("command_id"),
+                        dump_json(summary),
+                    ),
+                )
+                event = {
+                    "board_id": board_id,
+                    "boot_id": board.get("boot_id"),
+                    "timestamp_ms": now,
+                    "event_type": "board_offline_incident",
+                    "command_id": last_command.get("command_id"),
+                    "severity": "error",
+                    "message": category,
+                    "data": {"incident_id": incident_id, "category": category, "summary": summary},
+                }
+                self.conn.execute(
+                    """
+                    INSERT INTO events(board_id, boot_id, timestamp_ms, event_type, command_id, severity, message, data_json)
+                    VALUES(?,?,?,?,?,?,?,?)
+                    """,
+                    (
+                        board_id,
+                        board.get("boot_id"),
+                        now,
+                        "board_offline_incident",
+                        last_command.get("command_id"),
+                        "error",
+                        category,
+                        dump_json(event),
+                    ),
+                )
+
+    def board_diagnostics(self, board_id: str, limit: int = 200) -> dict[str, Any]:
+        boards = [board for board in self.list_boards() if board["board_id"] == board_id]
+        if not boards:
+            raise HTTPException(status_code=404, detail="board not found")
+        self.maintain_offline_incidents(boards)
+        events = self.recent_events(board_id=board_id, limit=limit)
+        incidents = self.recent_incidents(board_id=board_id, limit=20)
+        failures = self.recent_failures(board_id=board_id, limit=50)
+        log_snapshots = self.recent_events(board_id=board_id, event_type="log_snapshot", limit=5)
+        with self.lock:
+            metrics = [
+                compact_metric(json.loads(row["data_json"]))
+                for row in self.conn.execute(
+                    "SELECT data_json FROM metrics WHERE board_id=? ORDER BY timestamp_ms DESC, id DESC LIMIT 20",
+                    (board_id,),
+                )
+            ]
+            results = [
+                dashboard_result(json.loads(row["data_json"]))
+                for row in self.conn.execute(
+                    "SELECT data_json FROM results WHERE board_id=? ORDER BY timestamp_ms DESC, id DESC LIMIT 30",
+                    (board_id,),
+                )
+            ]
+            logs = [
+                dashboard_log(json.loads(row["data_json"]))
+                for row in self.conn.execute(
+                    "SELECT data_json FROM logs WHERE board_id=? ORDER BY timestamp_ms DESC, id DESC LIMIT 50",
+                    (board_id,),
+                )
+            ]
+        return {
+            "timestamp_ms": now_ms(),
+            "board": boards[0],
+            "incidents": incidents,
+            "events": events,
+            "log_snapshots": log_snapshots,
+            "latest_metrics": metrics,
+            "recent_results": results,
+            "recent_failures": failures,
+            "recent_logs": logs,
+        }
+
+    def diagnostics_summary(self, board_id: str | None = None, limit: int = 50) -> dict[str, Any]:
+        limit = max(1, min(int(limit or 50), 500))
+        boards = self.list_boards()
+        if board_id:
+            boards = [board for board in boards if board["board_id"] == board_id]
+            if not boards:
+                raise HTTPException(status_code=404, detail="board not found")
+        self.maintain_offline_incidents(boards)
+        failures = self.recent_failures(board_id=board_id, limit=limit)
+        incidents = self.recent_incidents(board_id=board_id, limit=limit)
+        events = self.recent_events(board_id=board_id, limit=limit)
+        recent_command_events = self.recent_events(board_id=board_id, limit=500)
+        failure_categories: dict[str, int] = {}
+        for failure in failures:
+            category = str(failure.get("failure_category") or "unknown")
+            failure_categories[category] = failure_categories.get(category, 0) + 1
+        command_last: dict[str, dict[str, Any]] = {}
+        for event in recent_command_events:
+            command_id = event.get("command_id")
+            if command_id:
+                command_last[str(command_id)] = event
+        active_commands = [
+            event
+            for event in command_last.values()
+            if event.get("event_type") in {"command_started", "command_progress"}
+        ]
+        cutoff_24h = now_ms() - 24 * 3600 * 1000
+        clauses = ["timestamp_ms>=?"]
+        params: list[Any] = [cutoff_24h]
+        if board_id:
+            clauses.append("board_id=?")
+            params.append(board_id)
+        with self.lock:
+            event_count_rows = [
+                dict(row)
+                for row in self.conn.execute(
+                    f"""
+                    SELECT event_type, severity, COUNT(*) AS count, MAX(timestamp_ms) AS last_ms
+                    FROM events
+                    WHERE {' AND '.join(clauses)}
+                    GROUP BY event_type, severity
+                    ORDER BY count DESC, event_type, severity
+                    LIMIT 50
+                    """,
+                    params,
+                ).fetchall()
+            ]
+            latest_log_snapshot_rows = [
+                dict(row)
+                for row in self.conn.execute(
+                    f"""
+                    SELECT board_id, MAX(timestamp_ms) AS timestamp_ms
+                    FROM events
+                    WHERE event_type='log_snapshot' {"AND board_id=?" if board_id else ""}
+                    GROUP BY board_id
+                    ORDER BY timestamp_ms DESC
+                    LIMIT 20
+                    """,
+                    (board_id,) if board_id else (),
+                ).fetchall()
+            ]
+        offline_boards = [
+            {
+                "board_id": board["board_id"],
+                "boot_id": board.get("boot_id"),
+                "hostname": board.get("hostname"),
+                "last_seen_ms": board.get("last_seen_ms"),
+                "wifi_ip": board.get("wifi_ip"),
+                "remote_ip": board.get("remote_ip"),
+            }
+            for board in boards
+            if not board.get("online")
+        ]
+        open_incidents = [item for item in incidents if item.get("status") == "open"]
+        latest_log_snapshots = [
+            {
+                "board_id": row["board_id"],
+                "timestamp_ms": row["timestamp_ms"],
+                "query": f"/api/v1/diagnostics/events?board_id={row['board_id']}&event_type=log_snapshot&limit=1",
+            }
+            for row in latest_log_snapshot_rows
+        ]
+        queries = [
+            {"name": "summary", "path": "/api/v1/diagnostics?limit=100"},
+            {"name": "boards", "path": "/api/v1/diagnostics/boards"},
+            {"name": "events", "path": "/api/v1/diagnostics/events?limit=200"},
+            {"name": "failures", "path": "/api/v1/diagnostics/failures?limit=100"},
+            {"name": "logs", "path": "/api/v1/diagnostics/logs?limit=200"},
+            {"name": "metrics", "path": "/api/v1/diagnostics/metrics?limit=200&compact=true"},
+            {"name": "board_detail", "path": "/api/v1/diagnostics/boards/{board_id}?limit=300"},
+            {"name": "command_detail", "path": "/api/v1/diagnostics/commands/{command_id}"},
+        ]
+        return {
+            "timestamp_ms": now_ms(),
+            "scope": {"board_id": board_id, "limit": limit},
+            "retention": {
+                "metrics_hours": settings.metrics_retain_hours,
+                "events_hours": settings.events_retain_hours,
+                "logs": "not automatically purged",
+                "results": "not automatically purged",
+            },
+            "boards": boards,
+            "offline_boards": offline_boards,
+            "open_incidents": open_incidents,
+            "recent_incidents": incidents,
+            "recent_failures": failures,
+            "failure_categories": failure_categories,
+            "active_or_unfinished_commands": active_commands[-50:],
+            "event_counts_24h": event_count_rows,
+            "recent_events": events,
+            "latest_log_snapshots": latest_log_snapshots,
+            "queries": queries,
+        }
+
     def snapshot(self) -> dict[str, Any]:
         boards = self.list_boards()
+        self.maintain_offline_incidents(boards)
         latest_metrics = {}
         schedule = self.schedule()
         with self.lock:
@@ -502,6 +1135,10 @@ class Store:
                 dashboard_result(json.loads(row["data_json"]))
                 for row in self.conn.execute("SELECT data_json FROM results ORDER BY timestamp_ms DESC, id DESC LIMIT 50")
             ]
+            events = self.event_rows(
+                self.conn.execute("SELECT * FROM events ORDER BY timestamp_ms DESC, id DESC LIMIT 80").fetchall(),
+                include_data=False,
+            )
             failed_where = "COALESCE(status, 'unknown') != 'passed'"
             cutoff_24h = now_ms() - 24 * 3600 * 1000
             total_row = self.conn.execute(
@@ -611,12 +1248,15 @@ class Store:
                 "by_type": type_rows,
             }
             artifact_count = self.conn.execute("SELECT COUNT(*) AS c FROM artifacts").fetchone()["c"]
+            incidents = self.recent_incidents(limit=20)
         return {
             "timestamp_ms": now_ms(),
             "boards": boards,
             "latest_metrics": latest_metrics,
             "recent_logs": logs,
             "recent_results": results,
+            "recent_events": events,
+            "recent_incidents": incidents,
             "result_stats": result_stats,
             "artifact_count": artifact_count,
             "schedule": schedule,
@@ -670,6 +1310,55 @@ def first_ipv4(values: Any) -> str | None:
     if isinstance(values, str):
         return values
     return None
+
+
+def compact_metric(metric: dict[str, Any]) -> dict[str, Any]:
+    if not metric:
+        return {}
+    system = metric.get("system") or {}
+    wifi = metric.get("wifi") or {}
+    bluetooth = metric.get("bluetooth") or {}
+    network = metric.get("network") or {}
+    return {
+        "timestamp_ms": metric.get("timestamp_ms"),
+        "board_id": metric.get("board_id"),
+        "boot_id": metric.get("boot_id"),
+        "uptime_sec": system.get("uptime_sec"),
+        "loadavg": system.get("loadavg"),
+        "mem_total": system.get("mem_total"),
+        "mem_available": system.get("mem_available"),
+        "max_temp_c": max_temp_c(metric.get("thermal") or []),
+        "wifi": {
+            "interface": wifi.get("interface"),
+            "ipv4": wifi.get("ipv4"),
+            "connected": wifi.get("connected"),
+            "ssid": wifi.get("ssid"),
+            "bssid": wifi.get("bssid"),
+            "signal_dbm": wifi.get("signal_dbm"),
+            "tx_bitrate": wifi.get("tx_bitrate"),
+            "rx_bitrate": wifi.get("rx_bitrate"),
+            "txpower_dbm": wifi.get("txpower_dbm"),
+            "tx_retries": wifi.get("tx_retries"),
+            "tx_failed": wifi.get("tx_failed"),
+        },
+        "bluetooth": {
+            "controller": bluetooth.get("controller"),
+            "available": bluetooth.get("available"),
+            "busy": bluetooth.get("busy"),
+            "stale": bluetooth.get("stale"),
+            "up": bluetooth.get("up"),
+            "address": bluetooth.get("address"),
+            "rx_errors": bluetooth.get("rx_errors"),
+            "tx_errors": bluetooth.get("tx_errors"),
+        },
+        "network": {
+            "uplink_interface": network.get("uplink_interface"),
+            "wifi_interface": network.get("wifi_interface"),
+            "uplink_ip": network.get("uplink_ip"),
+            "wifi_ip": network.get("wifi_ip"),
+            "uplink_ready": network.get("uplink_ready"),
+        },
+    }
 
 
 def metric_trend_point(board_id: str, timestamp_ms: int, metric: dict[str, Any], previous: dict[str, Any] | None) -> dict[str, Any]:
@@ -891,6 +1580,17 @@ async def logs_batch(payload: dict[str, Any]) -> dict[str, Any]:
     return {"ok": True, "count": len(logs)}
 
 
+@app.post("/api/v1/events/batch", dependencies=[Depends(require_auth)])
+async def events_batch(payload: dict[str, Any]) -> dict[str, Any]:
+    events = payload.get("events") or []
+    for item in events:
+        if "board_id" not in item and "board_id" in payload:
+            item["board_id"] = payload["board_id"]
+        if "boot_id" not in item and "boot_id" in payload:
+            item["boot_id"] = payload["boot_id"]
+    return {"ok": True, "count": store.insert_events(events)}
+
+
 @app.post("/api/v1/results/batch", dependencies=[Depends(require_auth)])
 async def results_batch(payload: dict[str, Any]) -> dict[str, Any]:
     store.insert_results(payload)
@@ -915,6 +1615,111 @@ async def crash_upload(payload: dict[str, Any]) -> dict[str, Any]:
 @app.get("/api/v1/agent/commands", dependencies=[Depends(require_auth)])
 async def commands(board_id: str, boot_id: str | None = None) -> dict[str, Any]:
     return {"commands": compute_commands(board_id)}
+
+
+@app.get("/api/v1/diagnostics")
+async def diagnostics_index(board_id: str | None = None, limit: int = 50) -> dict[str, Any]:
+    return store.diagnostics_summary(board_id=board_id, limit=limit)
+
+
+@app.get("/api/v1/diagnostics/summary")
+async def diagnostics_summary(board_id: str | None = None, limit: int = 50) -> dict[str, Any]:
+    return store.diagnostics_summary(board_id=board_id, limit=limit)
+
+
+@app.get("/api/v1/diagnostics/boards")
+async def diagnostics_boards() -> dict[str, Any]:
+    boards = store.list_boards()
+    store.maintain_offline_incidents(boards)
+    return {
+        "timestamp_ms": now_ms(),
+        "boards": boards,
+        "incidents": store.recent_incidents(limit=100),
+    }
+
+
+@app.get("/api/v1/diagnostics/boards/{board_id}")
+async def diagnostics_board(board_id: str, limit: int = 200) -> dict[str, Any]:
+    return store.board_diagnostics(board_id, limit=limit)
+
+
+@app.get("/api/v1/diagnostics/events")
+async def diagnostics_events(
+    board_id: str | None = None,
+    command_id: str | None = None,
+    event_type: str | None = None,
+    severity: str | None = None,
+    since_ms: int | None = None,
+    limit: int = 200,
+) -> dict[str, Any]:
+    return {
+        "timestamp_ms": now_ms(),
+        "events": store.recent_events(
+            board_id=board_id,
+            command_id=command_id,
+            event_type=event_type,
+            severity=severity,
+            since_ms=since_ms,
+            limit=limit,
+        ),
+    }
+
+
+@app.get("/api/v1/diagnostics/failures")
+async def diagnostics_failures(board_id: str | None = None, limit: int = 100, raw: bool = False) -> dict[str, Any]:
+    return {
+        "timestamp_ms": now_ms(),
+        "failures": store.recent_failures(board_id=board_id, limit=limit, raw=raw),
+    }
+
+
+@app.get("/api/v1/diagnostics/logs")
+async def diagnostics_logs(board_id: str | None = None, since_ms: int | None = None, limit: int = 200) -> dict[str, Any]:
+    return {
+        "timestamp_ms": now_ms(),
+        "logs": store.recent_logs(board_id=board_id, since_ms=since_ms, limit=limit),
+    }
+
+
+@app.get("/api/v1/diagnostics/metrics")
+async def diagnostics_metrics(
+    board_id: str | None = None,
+    since_ms: int | None = None,
+    limit: int = 200,
+    compact: bool = True,
+) -> dict[str, Any]:
+    return {
+        "timestamp_ms": now_ms(),
+        "metrics": store.recent_metrics(board_id=board_id, since_ms=since_ms, limit=limit, compact=compact),
+    }
+
+
+@app.get("/api/v1/diagnostics/incidents")
+async def diagnostics_incidents(board_id: str | None = None, limit: int = 100) -> dict[str, Any]:
+    boards = store.list_boards()
+    store.maintain_offline_incidents(boards)
+    return {
+        "timestamp_ms": now_ms(),
+        "incidents": store.recent_incidents(board_id=board_id, limit=limit),
+    }
+
+
+@app.get("/api/v1/diagnostics/commands/{command_id}")
+async def diagnostics_command(command_id: str) -> dict[str, Any]:
+    with store.lock:
+        rows = store.conn.execute(
+            "SELECT data_json FROM results WHERE command_id=? ORDER BY timestamp_ms DESC, id DESC",
+            (command_id,),
+        ).fetchall()
+        results = [dashboard_result(json.loads(row["data_json"])) for row in rows]
+        raw_results = [json.loads(row["data_json"]) for row in rows]
+    return {
+        "timestamp_ms": now_ms(),
+        "command_id": command_id,
+        "events": store.recent_events(command_id=command_id, limit=500),
+        "results": results,
+        "raw_results": raw_results,
+    }
 
 
 @app.get(f"{settings.dashboard_path}/api/snapshot")
@@ -957,18 +1762,20 @@ async def stream_dashboard(websocket: WebSocket) -> None:
         return
 
 
-async def purge_metrics_task() -> None:
-    """Periodically purge old metrics to prevent SQLite bloat."""
+async def purge_history_task() -> None:
+    """Periodically purge high-frequency telemetry to prevent SQLite bloat."""
     while True:
         await asyncio.sleep(3600)
         try:
-            deleted = store.purge_old_metrics()
+            deleted_metrics = store.purge_old_metrics()
+            deleted_events = store.purge_old_events()
+            deleted = deleted_metrics + deleted_events
             if deleted:
                 store.insert_logs([{
                     "board_id": "server",
                     "timestamp_ms": now_ms(),
                     "level": "info",
-                    "message": f"purged {deleted} old metrics rows",
+                    "message": f"purged old telemetry rows metrics={deleted_metrics} events={deleted_events}",
                 }])
         except Exception:
             pass
@@ -976,7 +1783,7 @@ async def purge_metrics_task() -> None:
 
 @app.on_event("startup")
 async def on_startup() -> None:
-    asyncio.create_task(purge_metrics_task())
+    asyncio.create_task(purge_history_task())
 
 
 def compute_commands(board_id: str) -> list[dict[str, Any]]:

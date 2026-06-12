@@ -206,11 +206,21 @@ function boardHealth(board, metric) {
   return { level: "good", text: "正常" };
 }
 
+function btStatus(bt = {}) {
+  if (bt.busy && bt.up) return { text: "UP / 测试中", level: "warn" };
+  if (bt.busy) return { text: "测试中", level: "warn" };
+  if (bt.up) return { text: "UP", level: "good" };
+  if (bt.available === true) return { text: "可用", level: "warn" };
+  if (bt.available === false) return { text: "不可用", level: "bad" };
+  return { text: "-", level: "warn" };
+}
+
 function boardCard(board, metric, rates) {
   const wifi = metric?.wifi || board.last_heartbeat?.wifi || {};
   const network = metric?.network || board.last_heartbeat?.network || {};
   const uplink = pickIface(metric, network.uplink_interface || "end0");
   const bt = metric?.bluetooth || {};
+  const btState = btStatus(bt);
   const temp = maxTemp(metric);
   const health = boardHealth(board, metric);
   const cls = `board ${health.level === "bad" ? "offline" : health.level === "warn" ? "warn" : ""}`;
@@ -226,7 +236,7 @@ function boardCard(board, metric, rates) {
         <div class="metric"><span>WiFi 接收</span><strong>${fmtRate(rates.rxBps)}</strong></div>
         <div class="metric"><span>WiFi 发送</span><strong>${fmtRate(rates.txBps)}</strong></div>
         <div class="metric"><span>链路速率</span><strong>${escapeHtml(wifi.tx_bitrate || "-")}</strong></div>
-        <div class="metric"><span>BT 状态</span><strong>${bt.up ? "UP" : bt.available ? "可用" : "-"}</strong></div>
+        <div class="metric"><span>BT 状态</span><strong>${escapeHtml(btState.text)}</strong></div>
         <div class="metric"><span>有线上报</span><strong>${escapeHtml(firstValue(uplink.ipv4, board.wired_ip || "-"))}</strong></div>
         <div class="metric"><span>内存</span><strong>${escapeHtml(memText(metric))}</strong></div>
       </div>
@@ -255,6 +265,8 @@ function render(snapshot) {
   renderBoardTable(rows);
   renderWifiTable(rows);
   renderBtTable(rows);
+  renderIncidents(snapshot.recent_incidents || []);
+  renderEvents(snapshot.recent_events || []);
   renderResults(results, snapshot.result_stats || {});
   renderLogs(logs);
   renderAdminBoards(boards);
@@ -292,7 +304,12 @@ function renderSchedule(schedule) {
   setText("schedule-end", fmtDateTime(endMs));
   setText("schedule-remaining", endMs ? (now >= endMs ? "已超过截止时间" : `剩余 ${fmtDuration((endMs - now) / 1000)}`) : "-");
   setText("schedule-wifi", `${schedule.wifi_epoch_sec || "-"} 秒`);
-  setText("schedule-wifi-detail", `iperf3 ${schedule.iperf3_port || "-"} / TCP ${schedule.wifi_tcp_sec || "-"} 秒`);
+  const currentMode = schedule.current_wifi_mode || {};
+  const nextMode = (schedule.upcoming_wifi_modes || [])[1] || {};
+  const modeText = currentMode.type
+    ? `当前 ${labelType(currentMode.type)}${nextMode.type ? ` / 下一档 ${labelType(nextMode.type)}` : ""}`
+    : `TCP ${schedule.wifi_tcp_sec || "-"} 秒`;
+  setText("schedule-wifi-detail", `iperf3 ${schedule.iperf3_port || "-"} / ${modeText}`);
   setText("schedule-bt", `${schedule.bt_period_sec || "-"} 秒`);
   syncScheduleInputs(startMs, endMs);
 }
@@ -429,13 +446,17 @@ function renderBtTable(rows) {
   $("bt-table").innerHTML = rows.length
     ? rows.map(({ board, metric }) => {
         const bt = metric?.bluetooth || {};
-        const status = bt.up ? "UP" : bt.available ? "可用" : "不可用";
-        const errorText = `RX ${bt.rx_errors ?? "-"} / TX ${bt.tx_errors ?? "-"}`;
+        const status = btStatus(bt);
+        const errorText = [
+          bt.busy ? "测试命令占用" : "",
+          bt.stale ? "沿用上次采样" : "",
+          `RX ${bt.rx_errors ?? "-"} / TX ${bt.tx_errors ?? "-"}`,
+        ].filter(Boolean).join(" / ");
         return `
           <tr>
             <td><strong>${escapeHtml(board.board_id)}</strong></td>
             <td>${escapeHtml(bt.controller || "-")}</td>
-            <td><span class="mini-status ${bt.up ? "good" : bt.available ? "warn" : "bad"}">${status}</span></td>
+            <td><span class="mini-status ${status.level}">${escapeHtml(status.text)}</span></td>
             <td>${escapeHtml(bt.address || "-")}</td>
             <td>${fmtBytes(bt.rx_bytes)}</td>
             <td>${fmtBytes(bt.tx_bytes)}</td>
@@ -443,6 +464,58 @@ function renderBtTable(rows) {
           </tr>`;
       }).join("")
     : `<tr><td colspan="7" class="empty">暂无蓝牙数据。</td></tr>`;
+}
+
+function renderIncidents(incidents) {
+  const visible = incidents.slice(0, 20);
+  const open = visible.filter((item) => item.status === "open").length;
+  setText("incident-summary", `显示 ${visible.length} 条 / 未恢复 ${open}`);
+  const body = $("incidents");
+  if (!body) return;
+  body.innerHTML = visible.length
+    ? visible.map((item) => {
+        const summary = item.summary || {};
+        const lastMetric = summary.last_metric || {};
+        const lastCommand = summary.last_command || {};
+        const lastResult = summary.last_result || {};
+        const wifi = lastMetric.wifi || {};
+        const bt = lastMetric.bluetooth || {};
+        const stateText = [
+          wifi.connected === undefined ? "" : `WiFi ${wifi.connected ? "已连" : "断开"}`,
+          wifi.signal_dbm === undefined || wifi.signal_dbm === null ? "" : `${wifi.signal_dbm} dBm`,
+          bt.up === undefined ? "" : `BT ${bt.up ? "UP" : "DOWN"}`,
+          lastMetric.max_temp_c === undefined || lastMetric.max_temp_c === null ? "" : `${Number(lastMetric.max_temp_c).toFixed(1)}℃`,
+          lastResult.failure_reason ? `前次异常 ${lastResult.failure_reason}` : "",
+        ].filter(Boolean).join(" / ") || "-";
+        return `
+          <tr>
+            <td>${fmtTime(item.started_at_ms)}</td>
+            <td><strong>${escapeHtml(item.board_id || "-")}</strong></td>
+            <td><span class="mini-status ${item.status === "open" ? "bad" : "good"}">${escapeHtml(labelIncidentStatus(item.status))}</span></td>
+            <td>${escapeHtml(labelIncidentCategory(item.category))}</td>
+            <td>${escapeHtml(item.last_command_id || lastCommand.command_id || "-")}</td>
+            <td>${escapeHtml(stateText)}</td>
+          </tr>`;
+      }).join("")
+    : `<tr><td colspan="6" class="empty">暂无离线事故。</td></tr>`;
+}
+
+function renderEvents(events) {
+  const visible = events.slice(-80).reverse();
+  setText("event-summary", `显示 ${visible.length} 条`);
+  const body = $("events");
+  if (!body) return;
+  body.innerHTML = visible.length
+    ? visible.map((item) => `
+        <tr>
+          <td>${fmtTime(item.timestamp_ms)}</td>
+          <td>${escapeHtml(item.board_id || "-")}</td>
+          <td><span class="mini-status ${statusLevelForSeverity(item.severity)}">${escapeHtml(labelLevel(item.severity))}</span></td>
+          <td>${escapeHtml(labelEventType(item.event_type))}<br><small>${escapeHtml(item.event_type || "-")}</small></td>
+          <td>${escapeHtml(item.command_id || "-")}</td>
+          <td>${escapeHtml(item.message || summarizeEventData(item.data))}</td>
+        </tr>`).join("")
+    : `<tr><td colspan="6" class="empty">暂无事件。</td></tr>`;
 }
 
 function renderResults(results, stats = {}) {
@@ -473,6 +546,10 @@ function renderResults(results, stats = {}) {
           summary.client_delay_sec ? `延迟 ${summary.client_delay_sec}秒` : "",
           summary.duration_ms ? `运行 ${(summary.duration_ms / 1000).toFixed(1)}秒` : "",
           summary.sample_count ? `样本 ${summary.sample_count}` : "",
+          item.failure_category ? `分类 ${labelFailureCategory(item.failure_category)}` : "",
+          item.failed_command ? `命令 ${item.failed_command}` : "",
+          item.stderr_excerpt ? `stderr ${item.stderr_excerpt}` : "",
+          item.failure_reason ? `原因 ${item.failure_reason}` : "",
           item.error ? String(item.error).slice(0, 80) : "",
         ].filter(Boolean).join(" / ") || "-";
         return `
@@ -841,6 +918,12 @@ function statusLevel(status) {
   return "warn";
 }
 
+function statusLevelForSeverity(severity) {
+  if (severity === "error" || severity === "bad") return "bad";
+  if (severity === "warn" || severity === "warning") return "warn";
+  return "good";
+}
+
 function labelType(type) {
   const labels = {
     wifi_iperf3_tcp: "WiFi TCP 满速",
@@ -863,6 +946,50 @@ function labelType(type) {
   return labels[type] || type || "-";
 }
 
+function labelEventType(type) {
+  const labels = {
+    heartbeat: "心跳",
+    metric_sample: "指标采样",
+    command_started: "命令开始",
+    command_progress: "命令运行中",
+    command_finished: "命令结束",
+    command_deferred: "命令延后",
+    agent_log: "Agent 日志",
+    log_snapshot: "日志快照",
+    agent_registered: "Agent 注册",
+    board_offline_incident: "离线事故",
+  };
+  return labels[type] || type || "-";
+}
+
+function labelIncidentStatus(status) {
+  const labels = { open: "未恢复", closed: "已恢复" };
+  return labels[status] || status || "-";
+}
+
+function labelIncidentCategory(category) {
+  const labels = {
+    lost_during_command: "命令中断",
+    board_offline: "板卡离线",
+  };
+  return labels[category] || category || "-";
+}
+
+function labelFailureCategory(category) {
+  const labels = {
+    board_offline: "板卡离线",
+    iperf3_busy: "iperf3占用",
+    iperf3_control: "iperf3控制链路",
+    wifi_loss: "WiFi全丢包",
+    udp_loss: "UDP丢包",
+    bt_mgmt_timeout: "BT管理超时",
+    bt_link_down: "BT链路断开",
+    agent_error: "Agent异常",
+    test_failed: "测试失败",
+  };
+  return labels[category] || category || "-";
+}
+
 function labelStatus(status) {
   const labels = {
     passed: "通过",
@@ -882,6 +1009,14 @@ function labelLevel(level) {
     debug: "调试",
   };
   return labels[level] || level || "-";
+}
+
+function summarizeEventData(data) {
+  if (!data || typeof data !== "object") return "-";
+  if (data.resource) return `资源 ${data.resource}`;
+  if (data.runtime_sec) return `运行 ${data.runtime_sec} 秒`;
+  if (data.status) return `状态 ${data.status}`;
+  return JSON.stringify(data).slice(0, 160);
 }
 
 function escapeHtml(value) {

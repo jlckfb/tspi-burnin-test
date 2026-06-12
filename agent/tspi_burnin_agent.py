@@ -50,6 +50,9 @@ DEFAULT_CONFIG = {
     "log_flush_interval_sec": 2.0,
     "command_poll_interval_sec": 2.0,
     "command_workers": 2,
+    "event_flush_interval_sec": 2.0,
+    "command_progress_interval_sec": 15.0,
+    "log_snapshot_interval_sec": 60.0,
     "data_dir": "/var/lib/tspi-burnin",
     "max_spool_files": 20000,
     "request_timeout_sec": 5.0,
@@ -74,6 +77,13 @@ def command_output_text(value: Any) -> str:
     return str(value).strip()
 
 
+def subprocess_env() -> dict[str, str]:
+    env = dict(os.environ)
+    for key in ("NOTIFY_SOCKET", "WATCHDOG_PID", "WATCHDOG_USEC"):
+        env.pop(key, None)
+    return env
+
+
 def run_cmd(args: list[str], timeout: float = 5.0) -> dict[str, Any]:
     started = monotonic_ms()
     try:
@@ -84,6 +94,7 @@ def run_cmd(args: list[str], timeout: float = 5.0) -> dict[str, Any]:
             stderr=subprocess.PIPE,
             timeout=timeout,
             check=False,
+            env=subprocess_env(),
         )
         return {
             "ok": proc.returncode == 0,
@@ -436,11 +447,14 @@ class Uploader:
 
 
 class Collector:
-    def __init__(self, config: dict[str, Any]) -> None:
+    def __init__(self, config: dict[str, Any], bt_lock: threading.Lock | None = None) -> None:
         self.config = config
         self.uplink_interface = str(config["uplink_interface"])
         self.wifi_interface = str(config["wifi_interface"])
         self.bt_controller = str(config["bt_controller"])
+        self.bt_lock = bt_lock
+        self.bt_metrics_cache: dict[str, Any] = {}
+        self.bt_metrics_cache_lock = threading.Lock()
 
     def collect(self) -> dict[str, Any]:
         return {
@@ -568,16 +582,40 @@ class Collector:
 
     def bluetooth_metrics(self) -> dict[str, Any]:
         info: dict[str, Any] = {"controller": self.bt_controller}
-        hciconfig = run_cmd(["hciconfig", self.bt_controller, "-a"], timeout=3)
-        info["available"] = hciconfig["ok"]
-        info["hciconfig_raw"] = hciconfig["stdout"][-2048:]
-        info.update(parse_hciconfig(hciconfig["stdout"]))
-        btmgmt = run_cmd(["btmgmt", "info"], timeout=3)
-        info["btmgmt_ok"] = btmgmt["ok"]
-        info["btmgmt_raw"] = btmgmt["stdout"][-2048:]
-        rfkill = run_cmd(["rfkill", "list"], timeout=3)
-        info["rfkill_raw"] = rfkill["stdout"][-2048:]
-        return info
+        acquired = True
+        if self.bt_lock is not None:
+            acquired = self.bt_lock.acquire(blocking=False)
+        if not acquired:
+            with self.bt_metrics_cache_lock:
+                info.update(self.bt_metrics_cache)
+            if not self.bt_metrics_cache:
+                hciconfig = run_cmd(["hciconfig", self.bt_controller, "-a"], timeout=2)
+                info["available"] = hciconfig["ok"]
+                info["hciconfig_raw"] = hciconfig["stdout"][-2048:]
+                info.update(parse_hciconfig(hciconfig["stdout"]))
+            info["controller"] = self.bt_controller
+            info.setdefault("available", None)
+            info["busy"] = True
+            info["stale"] = bool(self.bt_metrics_cache)
+            return info
+        try:
+            hciconfig = run_cmd(["hciconfig", self.bt_controller, "-a"], timeout=3)
+            info["available"] = hciconfig["ok"]
+            info["hciconfig_raw"] = hciconfig["stdout"][-2048:]
+            info.update(parse_hciconfig(hciconfig["stdout"]))
+            btmgmt = run_cmd(["btmgmt", "info"], timeout=3)
+            info["btmgmt_ok"] = btmgmt["ok"]
+            info["btmgmt_raw"] = btmgmt["stdout"][-2048:]
+            rfkill = run_cmd(["rfkill", "list"], timeout=3)
+            info["rfkill_raw"] = rfkill["stdout"][-2048:]
+            info["busy"] = False
+            info["stale"] = False
+            with self.bt_metrics_cache_lock:
+                self.bt_metrics_cache = dict(info)
+            return info
+        finally:
+            if self.bt_lock is not None:
+                self.bt_lock.release()
 
     def process_metrics(self) -> dict[str, Any]:
         return {
@@ -723,36 +761,87 @@ def l2test_summary(result: dict[str, Any], duration_sec: int) -> dict[str, Any]:
     }
 
 
+def command_resource(command_type: Any) -> str | None:
+    value = str(command_type or "")
+    if value.startswith("wifi_"):
+        return "wifi"
+    if value.startswith("bt_"):
+        return "bt"
+    return None
+
+
 class CommandRunner:
-    def __init__(self, config: dict[str, Any], state: LocalState, uploader: Uploader, log_queue: queue.Queue[dict[str, Any]]) -> None:
+    def __init__(
+        self,
+        config: dict[str, Any],
+        state: LocalState,
+        uploader: Uploader,
+        log_queue: queue.Queue[dict[str, Any]],
+        event_queue: queue.Queue[dict[str, Any]],
+        bt_lock: threading.Lock | None = None,
+    ) -> None:
         self.config = config
         self.state = state
         self.uploader = uploader
         self.log_queue = log_queue
+        self.event_queue = event_queue
+        self.bt_lock = bt_lock
         self.active: set[str] = set()
+        self.active_resources: set[str] = set()
         self.lock = threading.Lock()
 
     def maybe_start(self, command: dict[str, Any]) -> None:
         command_id = str(command.get("id") or "")
         if not command_id:
             return
+        resource = command_resource(command.get("type"))
         with self.lock:
             if command_id in self.active or command_id in self.state.completed_commands:
+                return
+            if resource and resource in self.active_resources:
+                self._event(
+                    "command_deferred",
+                    command_id=command_id,
+                    severity="warn",
+                    message=f"{resource} resource busy",
+                    data={"command": command, "resource": resource},
+                )
                 return
             if len(self.active) >= int(self.config.get("command_workers", 1)):
                 return
             self.active.add(command_id)
+            if resource:
+                self.active_resources.add(resource)
         thread = threading.Thread(target=self._run_guarded, args=(command,), daemon=True)
         thread.start()
 
     def _run_guarded(self, command: dict[str, Any]) -> None:
         command_id = str(command["id"])
+        resource = command_resource(command.get("type"))
+        started_at = now_ms()
+        stop_progress = threading.Event()
+        progress_thread = threading.Thread(target=self._progress_loop, args=(command, started_at, stop_progress), daemon=True)
         try:
             self._log("info", "starting command", command=command)
+            self._event(
+                "command_started",
+                command_id=command_id,
+                message="command started",
+                data={"command": command, "resource": resource},
+            )
+            progress_thread.start()
             result = self.run(command)
             self._stamp_result(result)
+            enrich_failure(result)
             self.uploader.post("/api/v1/results/batch", {"results": [result]})
             self._log("info", "command finished", command_id=command_id, status=result.get("status"))
+            self._event(
+                "command_finished",
+                command_id=command_id,
+                severity="error" if result.get("status") not in {"passed", "unsupported"} else "info",
+                message=str(result.get("failure_reason") or result.get("status") or "command finished"),
+                data={"result": dashboard_result_for_agent(result), "resource": resource},
+            )
         except Exception as exc:
             result = {
                 "command_id": command_id,
@@ -762,18 +851,66 @@ class CommandRunner:
                 "timestamp_ms": now_ms(),
             }
             self._stamp_result(result)
+            enrich_failure(result)
             self.uploader.post("/api/v1/results/batch", {"results": [result]})
             self._log("error", "command failed in agent", command_id=command_id, error=repr(exc))
+            self._event(
+                "command_finished",
+                command_id=command_id,
+                severity="error",
+                message=str(result.get("failure_reason") or repr(exc)),
+                data={"result": dashboard_result_for_agent(result), "resource": resource},
+            )
         finally:
+            stop_progress.set()
+            progress_thread.join(timeout=1.0)
             self.state.mark_command_done(command_id)
             with self.lock:
                 self.active.discard(command_id)
+                if resource:
+                    self.active_resources.discard(resource)
 
     def _stamp_result(self, result: dict[str, Any]) -> None:
         result.setdefault("board_id", self.config["board_id"])
         result.setdefault("boot_id", self.state.boot_id)
         result.setdefault("seq", self.state.next_seq())
         result.setdefault("timestamp_ms", result.get("finished_at_ms") or now_ms())
+
+    def _progress_loop(self, command: dict[str, Any], started_at: int, stop_event: threading.Event) -> None:
+        interval = max(5.0, float(self.config.get("command_progress_interval_sec") or 15.0))
+        command_id = str(command.get("id") or "")
+        while not stop_event.wait(interval):
+            self._event(
+                "command_progress",
+                command_id=command_id,
+                message="command running",
+                data={
+                    "command": command,
+                    "resource": command_resource(command.get("type")),
+                    "started_at_ms": started_at,
+                    "runtime_sec": round((now_ms() - started_at) / 1000, 1),
+                    "state": runtime_snapshot(self.config, command),
+                },
+            )
+
+    def _event(
+        self,
+        event_type: str,
+        command_id: str | None = None,
+        severity: str = "info",
+        message: str = "",
+        data: dict[str, Any] | None = None,
+    ) -> None:
+        self.event_queue.put(
+            {
+                "timestamp_ms": now_ms(),
+                "event_type": event_type,
+                "command_id": command_id,
+                "severity": severity,
+                "message": message,
+                "data": data or {},
+            }
+        )
 
     def run(self, command: dict[str, Any]) -> dict[str, Any]:
         command_type = command.get("type")
@@ -792,19 +929,38 @@ class CommandRunner:
         if command_type == "wifi_ping":
             return self.run_wifi_ping(command)
         if command_type in {"bt_ble_probe", "bt_ble_advertise", "bt_ble_scan"}:
-            return self.run_bt_ble(command)
+            return self.run_with_bt_lock(self.run_bt_ble, command)
         if command_type == "bt_bredr_inquiry":
-            return self.run_bt_bredr_inquiry(command)
+            return self.run_with_bt_lock(self.run_bt_bredr_inquiry, command)
         if command_type == "bt_l2ping":
-            return self.run_bt_l2ping(command)
+            return self.run_with_bt_lock(self.run_bt_l2ping, command)
         if command_type == "bt_l2test":
-            return self.run_bt_l2test(command)
+            return self.run_with_bt_lock(self.run_bt_l2test, command)
         return {
             "command_id": command.get("id"),
             "type": command_type,
             "status": "unsupported",
             "timestamp_ms": now_ms(),
         }
+
+    def run_with_bt_lock(self, fn: Any, command: dict[str, Any]) -> dict[str, Any]:
+        if self.bt_lock is None:
+            return fn(command)
+        acquired = self.bt_lock.acquire(timeout=5)
+        if not acquired:
+            return {
+                "command_id": command.get("id"),
+                "type": command.get("type"),
+                "status": "failed",
+                "started_at_ms": now_ms(),
+                "finished_at_ms": now_ms(),
+                "summary": {"error": "bt resource busy"},
+                "error": "bt resource busy",
+            }
+        try:
+            return fn(command)
+        finally:
+            self.bt_lock.release()
 
     def run_iperf3(self, command: dict[str, Any]) -> dict[str, Any]:
         peer_ip = str(command["peer_ip"])
@@ -938,7 +1094,15 @@ class CommandRunner:
                 "adaptive_probe_summary": probe_text,
             }
         )
-        status = "passed" if result["ok"] and parsed else "failed"
+        udp_loss_error = ""
+        if is_udp:
+            final_loss = number_or_none(summary.get("lost_percent"))
+            udp_max_loss = float(command.get("max_loss_percent", adaptive_max_loss) or adaptive_max_loss)
+            summary["udp_max_loss_percent"] = udp_max_loss
+            summary["udp_loss_exceeded"] = bool(final_loss is not None and final_loss > udp_max_loss)
+            if summary["udp_loss_exceeded"]:
+                udp_loss_error = f"udp loss {final_loss:.2f}% exceeds {udp_max_loss:.2f}%"
+        status = "passed" if result["ok"] and parsed and not udp_loss_error else "failed"
         return {
             "command_id": command.get("id"),
             "type": command_type,
@@ -950,6 +1114,7 @@ class CommandRunner:
             "preflight": preflight,
             "args": redact_args(args),
             "returncode": result["returncode"],
+            "error": udp_loss_error or ((parsed or {}).get("error") if isinstance(parsed, dict) else ""),
             "stderr": result["stderr"][-4096:],
             "summary": summary,
             "raw": parsed,
@@ -1277,6 +1442,280 @@ def parse_l2ping_summary(output: str) -> dict[str, Any]:
     return summary
 
 
+def failure_info(result: dict[str, Any]) -> dict[str, str]:
+    summary = result.get("summary") if isinstance(result.get("summary"), dict) else {}
+    raw = result.get("raw")
+    reason = result.get("error") or result.get("stderr") or summary.get("error")
+    command = ""
+    stderr = ""
+    if isinstance(raw, dict):
+        reason = reason or raw.get("error") or (raw.get("end") or {}).get("error")
+        stderr = str(raw.get("stderr") or "")[-300:]
+    elif isinstance(raw, list):
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            item_result = item.get("result") if isinstance(item.get("result"), dict) else {}
+            if item_result and not item_result.get("ok"):
+                command = str(item.get("cmd") or "")
+                stderr = str(item_result.get("stderr") or item_result.get("stdout") or "")[-300:]
+                reason = reason or stderr or f"{command} failed"
+                break
+    if not reason and result.get("status") and result.get("status") != "passed":
+        reason = str(result.get("status"))
+    text = str(reason or "").strip()
+    return {
+        "reason": text[:500],
+        "category": classify_failure_for_agent(result, text),
+        "command": command[:240],
+        "stderr": stderr[:500],
+    }
+
+
+def classify_failure_for_agent(result: dict[str, Any], reason: str) -> str:
+    text = f"{result.get('type') or ''} {result.get('status') or ''} {reason}".lower()
+    summary = result.get("summary") if isinstance(result.get("summary"), dict) else {}
+    if summary.get("udp_loss_exceeded") or "udp loss" in text:
+        return "udp_loss"
+    if "server is busy" in text:
+        return "iperf3_busy"
+    if "connection reset" in text or "resource temporarily unavailable" in text:
+        return "iperf3_control"
+    if "btmgmt" in text or "hcitool" in text or ("timeout" in text and str(result.get("type") or "").startswith("bt_")):
+        return "bt_mgmt_timeout"
+    if "host is down" in text or "can't connect" in text:
+        return "bt_link_down"
+    if result.get("status") == "agent_error":
+        return "agent_error"
+    return "test_failed" if result.get("status") and result.get("status") != "passed" else ""
+
+
+def enrich_failure(result: dict[str, Any]) -> None:
+    if result.get("status") == "passed":
+        return
+    info = failure_info(result)
+    result.setdefault("failure_reason", info["reason"])
+    result.setdefault("failure_category", info["category"])
+    result.setdefault("failed_command", info["command"])
+    result.setdefault("stderr_excerpt", info["stderr"])
+
+
+def dashboard_result_for_agent(result: dict[str, Any]) -> dict[str, Any]:
+    summary = result.get("summary") if isinstance(result.get("summary"), dict) else {}
+    return {
+        "command_id": result.get("command_id"),
+        "type": result.get("type"),
+        "status": result.get("status"),
+        "started_at_ms": result.get("started_at_ms"),
+        "finished_at_ms": result.get("finished_at_ms"),
+        "timestamp_ms": result.get("timestamp_ms"),
+        "peer_ip": result.get("peer_ip") or summary.get("peer_ip"),
+        "peer_bt_mac": result.get("peer_bt_mac") or summary.get("peer_bt_mac"),
+        "returncode": result.get("returncode") or summary.get("returncode"),
+        "failure_reason": result.get("failure_reason"),
+        "failure_category": result.get("failure_category"),
+        "failed_command": result.get("failed_command"),
+        "stderr_excerpt": result.get("stderr_excerpt"),
+        "summary": {
+            key: summary.get(key)
+            for key in (
+                "sent_bits_per_second",
+                "received_bits_per_second",
+                "bits_per_second",
+                "lost_percent",
+                "retransmits",
+                "wifi_path_ok",
+                "route_dev",
+                "bound_dev",
+                "adaptive_selected_bandwidth",
+                "adaptive_probe_summary",
+                "udp_max_loss_percent",
+                "udp_loss_exceeded",
+                "connected",
+                "connect_failed",
+                "reset_by_peer",
+                "connection_aborted",
+                "duration_ms",
+                "sample_count",
+            )
+            if key in summary
+        },
+    }
+
+
+def compact_metric_event(metric: dict[str, Any]) -> dict[str, Any]:
+    system = metric.get("system") if isinstance(metric.get("system"), dict) else {}
+    wifi = metric.get("wifi") if isinstance(metric.get("wifi"), dict) else {}
+    bluetooth = metric.get("bluetooth") if isinstance(metric.get("bluetooth"), dict) else {}
+    network = metric.get("network") if isinstance(metric.get("network"), dict) else {}
+    temps = [zone.get("temp_millic") for zone in metric.get("thermal", []) if isinstance(zone, dict) and zone.get("temp_millic") is not None]
+    return {
+        "timestamp_ms": metric.get("timestamp_ms"),
+        "system": {
+            "uptime_sec": system.get("uptime_sec"),
+            "loadavg": system.get("loadavg"),
+            "mem_total": system.get("mem_total"),
+            "mem_available": system.get("mem_available"),
+        },
+        "max_temp_millic": max(temps) if temps else None,
+        "wifi": {
+            "interface": wifi.get("interface"),
+            "ipv4": wifi.get("ipv4"),
+            "connected": wifi.get("connected"),
+            "ssid": wifi.get("ssid"),
+            "bssid": wifi.get("bssid"),
+            "signal_dbm": wifi.get("signal_dbm"),
+            "tx_bitrate": wifi.get("tx_bitrate"),
+            "rx_bitrate": wifi.get("rx_bitrate"),
+            "tx_retries": wifi.get("tx_retries"),
+            "tx_failed": wifi.get("tx_failed"),
+        },
+        "bluetooth": {
+            "controller": bluetooth.get("controller"),
+            "available": bluetooth.get("available"),
+            "busy": bluetooth.get("busy"),
+            "stale": bluetooth.get("stale"),
+            "up": bluetooth.get("up"),
+            "address": bluetooth.get("address"),
+            "rx_errors": bluetooth.get("rx_errors"),
+            "tx_errors": bluetooth.get("tx_errors"),
+        },
+        "network": {
+            "uplink_ip": network.get("uplink_ip"),
+            "wifi_ip": network.get("wifi_ip"),
+            "uplink_ready": network.get("uplink_ready"),
+        },
+    }
+
+
+def runtime_snapshot(config: dict[str, Any], command: dict[str, Any] | None = None) -> dict[str, Any]:
+    wifi_iface = str(config.get("wifi_interface") or "wlan0")
+    bt_controller = str(config.get("bt_controller") or "hci0")
+    snapshot: dict[str, Any] = {
+        "timestamp_ms": now_ms(),
+        "system": light_system_snapshot(),
+        "thermal": light_thermal_snapshot(),
+        "processes": process_snapshot(),
+    }
+    snapshot["wifi"] = light_wifi_snapshot(wifi_iface)
+    snapshot["bluetooth"] = light_bt_snapshot(bt_controller)
+    if command and str(command.get("peer_ip") or ""):
+        peer_ip = str(command.get("peer_ip"))
+        local_ip = iface_ipv4(wifi_iface)
+        route = run_cmd(["ip", "route", "get", peer_ip, "from", local_ip or "0.0.0.0"], timeout=2)
+        snapshot["route_to_peer"] = {
+            "peer_ip": peer_ip,
+            "local_ip": local_ip,
+            "ok": route.get("ok"),
+            "dev": parse_route_dev(route.get("stdout") or ""),
+            "raw": str(route.get("stdout") or "")[-512:],
+        }
+    return snapshot
+
+
+def light_system_snapshot() -> dict[str, Any]:
+    data: dict[str, Any] = {}
+    with contextlib.suppress(Exception):
+        data["uptime_sec"] = float(read_text("/proc/uptime").split()[0])
+    with contextlib.suppress(Exception):
+        data["loadavg"] = list(os.getloadavg())
+    meminfo = {}
+    with contextlib.suppress(Exception):
+        for line in read_text("/proc/meminfo").splitlines():
+            key, raw = line.split(":", 1)
+            if key in {"MemTotal", "MemAvailable", "SwapTotal", "SwapFree"}:
+                meminfo[key] = int(raw.strip().split()[0]) * 1024
+    data["mem_total"] = meminfo.get("MemTotal")
+    data["mem_available"] = meminfo.get("MemAvailable")
+    return data
+
+
+def light_thermal_snapshot() -> list[dict[str, Any]]:
+    zones = []
+    for zone in sorted(Path("/sys/class/thermal").glob("thermal_zone*")):
+        with contextlib.suppress(Exception):
+            zones.append({"name": read_text(zone / "type").strip(), "temp_millic": int(read_text(zone / "temp").strip())})
+    return zones
+
+
+def light_wifi_snapshot(iface: str) -> dict[str, Any]:
+    link = run_cmd(["iw", "dev", iface, "link"], timeout=2)
+    data = {"interface": iface, "ipv4": iface_ipv4(iface), "connected": "Connected to" in str(link.get("stdout") or "")}
+    if link.get("stdout"):
+        data.update(parse_iw_link(str(link["stdout"])))
+        data["link_raw"] = str(link["stdout"])[-1024:]
+    return data
+
+
+def light_bt_snapshot(controller: str) -> dict[str, Any]:
+    hciconfig = run_cmd(["hciconfig", controller, "-a"], timeout=2)
+    data = {"controller": controller, "available": hciconfig.get("ok")}
+    if hciconfig.get("stdout"):
+        data.update(parse_hciconfig(str(hciconfig["stdout"])))
+        data["hciconfig_raw"] = str(hciconfig["stdout"])[-1024:]
+    return data
+
+
+def process_snapshot() -> list[str]:
+    targets = {"iperf3", "l2test", "l2ping", "btmgmt", "hcitool", "ping"}
+    rows: list[str] = []
+    for proc_dir in Path("/proc").iterdir():
+        if not proc_dir.name.isdigit():
+            continue
+        pid = proc_dir.name
+        try:
+            comm = read_text(proc_dir / "comm", limit=128).strip()
+            cmdline_raw = (proc_dir / "cmdline").read_bytes()[:4096]
+            cmdline = cmdline_raw.replace(b"\x00", b" ").decode("utf-8", errors="replace").strip()
+            name = comm or Path(cmdline.split(" ", 1)[0]).name
+            if name not in targets and not any(part in targets for part in cmdline.split()):
+                continue
+            status = {}
+            for line in read_text(proc_dir / "status", limit=4096).splitlines():
+                if line.startswith(("PPid:", "State:", "Threads:", "VmRSS:")):
+                    key, value = line.split(":", 1)
+                    status[key] = " ".join(value.split())
+            rows.append(
+                "pid={pid} ppid={ppid} state={state} threads={threads} rss={rss} cmd={cmd}".format(
+                    pid=pid,
+                    ppid=status.get("PPid", "?"),
+                    state=status.get("State", "?"),
+                    threads=status.get("Threads", "?"),
+                    rss=status.get("VmRSS", "?"),
+                    cmd=(cmdline or comm)[:360],
+                )
+            )
+        except Exception:
+            continue
+    return sorted(rows)[-40:]
+
+
+def diagnostic_log_snapshot(config: dict[str, Any]) -> dict[str, Any]:
+    units = [
+        "tspi-burnin-agent.service",
+        "tspi-burnin-iperf3.service",
+        "bluetooth.service",
+        "NetworkManager.service",
+        "wpa_supplicant.service",
+    ]
+    journals = []
+    for unit in units:
+        result = run_cmd(["journalctl", "-u", unit, "-n", "80", "--no-pager", "-o", "short-iso"], timeout=5)
+        journals.append({"unit": unit, "ok": result.get("ok"), "text": str(result.get("stdout") or result.get("stderr") or "")[-6000:]})
+    dmesg = run_cmd(["dmesg", "-T"], timeout=5)
+    status_agent = run_cmd(["systemctl", "--no-pager", "--full", "status", "tspi-burnin-agent.service"], timeout=5)
+    status_iperf = run_cmd(["systemctl", "--no-pager", "--full", "status", "tspi-burnin-iperf3.service"], timeout=5)
+    return {
+        "snapshot": runtime_snapshot(config),
+        "journals": journals,
+        "dmesg_tail": str(dmesg.get("stdout") or dmesg.get("stderr") or "")[-12000:],
+        "systemd": {
+            "agent": str(status_agent.get("stdout") or status_agent.get("stderr") or "")[-6000:],
+            "iperf3": str(status_iperf.get("stdout") or status_iperf.get("stderr") or "")[-6000:],
+        },
+    }
+
+
 def capture_btmon(controller: str, duration_sec: int) -> dict[str, Any] | None:
     if duration_sec <= 0 or not shutil.which("btmon"):
         return None
@@ -1286,6 +1725,7 @@ def capture_btmon(controller: str, duration_sec: int) -> dict[str, Any] | None:
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
+        env=subprocess_env(),
     )
     try:
         time.sleep(duration_sec)
@@ -1311,9 +1751,11 @@ class Agent:
         self.state = LocalState(self.data_dir)
         self.state.load()
         self.uploader = Uploader(self.config, self.state)
-        self.collector = Collector(self.config)
+        self.bt_lock = threading.Lock()
+        self.collector = Collector(self.config, self.bt_lock)
         self.log_queue: queue.Queue[dict[str, Any]] = queue.Queue()
-        self.runner = CommandRunner(self.config, self.state, self.uploader, self.log_queue)
+        self.event_queue: queue.Queue[dict[str, Any]] = queue.Queue()
+        self.runner = CommandRunner(self.config, self.state, self.uploader, self.log_queue, self.event_queue, self.bt_lock)
         self.sd_notify = SdNotify()
         self.stop_event = threading.Event()
 
@@ -1329,15 +1771,19 @@ class Agent:
             threading.Thread(target=self.heartbeat_loop, daemon=True),
             threading.Thread(target=self.metrics_loop, daemon=True),
             threading.Thread(target=self.log_loop, daemon=True),
+            threading.Thread(target=self.event_loop, daemon=True),
+            threading.Thread(target=self.diagnostic_loop, daemon=True),
             threading.Thread(target=self.command_loop, daemon=True),
             threading.Thread(target=self.spool_loop, daemon=True),
-            threading.Thread(target=self.watchdog_loop, daemon=True),
         ]
         for thread in threads:
             thread.start()
         self.sd_notify.ready()
+        last_watchdog = 0.0
         while not self.stop_event.wait(1.0):
-            pass
+            if time.monotonic() - last_watchdog >= 10.0:
+                self.sd_notify.watchdog()
+                last_watchdog = time.monotonic()
 
     def _base_payload(self) -> dict[str, Any]:
         return {
@@ -1346,6 +1792,18 @@ class Agent:
             "seq": self.state.next_seq(),
             "agent_version": "0.2.0",
         }
+
+    def _stamp_event(self, event: dict[str, Any]) -> dict[str, Any]:
+        stamped = dict(event)
+        stamped.setdefault("timestamp_ms", now_ms())
+        stamped.setdefault("severity", "info")
+        if "board_id" not in stamped:
+            stamped.update(self._base_payload())
+        else:
+            stamped.setdefault("boot_id", self.state.boot_id)
+            stamped.setdefault("seq", self.state.next_seq())
+            stamped.setdefault("agent_version", "0.2.0")
+        return stamped
 
     def register(self) -> None:
         payload = self._base_payload()
@@ -1362,6 +1820,7 @@ class Agent:
             }
         )
         self.uploader.post("/api/v1/agent/register", payload)
+        self.event_queue.put({"timestamp_ms": now_ms(), "event_type": "agent_registered", "message": "agent registered", "data": payload})
 
     def heartbeat_loop(self) -> None:
         interval = float(self.config["heartbeat_interval_sec"])
@@ -1370,6 +1829,19 @@ class Agent:
             payload.update(self.collector.heartbeat())
             atomic_write_json(self.state.last_state_path, payload)
             self.uploader.post("/api/v1/agent/heartbeat", payload)
+            self.event_queue.put(
+                {
+                    "timestamp_ms": payload.get("timestamp_ms") or now_ms(),
+                    "event_type": "heartbeat",
+                    "message": "heartbeat",
+                    "data": {
+                        "hostname": payload.get("hostname"),
+                        "wifi": payload.get("wifi"),
+                        "network": payload.get("network"),
+                        "bluetooth": payload.get("bluetooth"),
+                    },
+                }
+            )
             self.stop_event.wait(interval)
 
     def metrics_loop(self) -> None:
@@ -1378,6 +1850,14 @@ class Agent:
             metric = self.collector.collect()
             metric.update(self._base_payload())
             self.uploader.post("/api/v1/metrics/batch", {"metrics": [metric]})
+            self.event_queue.put(
+                {
+                    "timestamp_ms": metric.get("timestamp_ms") or now_ms(),
+                    "event_type": "metric_sample",
+                    "message": "metric sample",
+                    "data": compact_metric_event(metric),
+                }
+            )
             self.stop_event.wait(interval)
 
     def log_loop(self) -> None:
@@ -1391,6 +1871,15 @@ class Agent:
                 event = self.log_queue.get(timeout=0.2)
                 event.update(self._base_payload())
                 batch.append(event)
+                self.event_queue.put(
+                    {
+                        "timestamp_ms": event.get("timestamp_ms") or now_ms(),
+                        "event_type": "agent_log",
+                        "severity": str(event.get("level") or "info"),
+                        "message": str(event.get("message") or ""),
+                        "data": {key: value for key, value in event.items() if key not in {"timestamp_ms", "board_id", "boot_id", "seq"}},
+                    }
+                )
                 with log_file.open("a", encoding="utf-8") as handle:
                     handle.write(json.dumps(event, ensure_ascii=True, separators=(",", ":")) + "\n")
                     handle.flush()
@@ -1401,6 +1890,45 @@ class Agent:
                 self.uploader.post("/api/v1/logs/batch", {"logs": batch})
                 batch = []
                 last_flush = time.monotonic()
+        if batch:
+            self.uploader.post("/api/v1/logs/batch", {"logs": batch})
+
+    def event_loop(self) -> None:
+        interval = float(self.config.get("event_flush_interval_sec") or 2.0)
+        batch: list[dict[str, Any]] = []
+        last_flush = time.monotonic()
+        while not self.stop_event.is_set():
+            try:
+                event = self.event_queue.get(timeout=0.2)
+                batch.append(self._stamp_event(event))
+            except queue.Empty:
+                pass
+            if batch and (time.monotonic() - last_flush >= interval or len(batch) >= 50):
+                self.uploader.post("/api/v1/events/batch", {"events": batch})
+                batch = []
+                last_flush = time.monotonic()
+        while True:
+            try:
+                batch.append(self._stamp_event(self.event_queue.get_nowait()))
+            except queue.Empty:
+                break
+        if batch:
+            self.uploader.post("/api/v1/events/batch", {"events": batch})
+
+    def diagnostic_loop(self) -> None:
+        interval = max(30.0, float(self.config.get("log_snapshot_interval_sec") or 60.0))
+        while not self.stop_event.is_set():
+            self.stop_event.wait(interval)
+            if self.stop_event.is_set():
+                break
+            self.event_queue.put(
+                {
+                    "timestamp_ms": now_ms(),
+                    "event_type": "log_snapshot",
+                    "message": "periodic diagnostic snapshot",
+                    "data": diagnostic_log_snapshot(self.config),
+                }
+            )
 
     def command_loop(self) -> None:
         interval = float(self.config["command_poll_interval_sec"])
@@ -1420,11 +1948,6 @@ class Agent:
             if flushed:
                 self.log_queue.put({"timestamp_ms": now_ms(), "level": "info", "message": "flushed spool", "count": flushed})
             self.stop_event.wait(5.0)
-
-    def watchdog_loop(self) -> None:
-        while not self.stop_event.is_set():
-            self.sd_notify.watchdog()
-            self.stop_event.wait(10.0)
 
     def upload_startup_artifacts(self) -> None:
         artifacts = []
