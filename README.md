@@ -200,6 +200,8 @@ journalctl -u tspi-burnin-agent.service -f
 |------|------|
 | `BURNIN_WIFI_EPOCH_SEC` | WiFi 测试轮转周期 |
 | `BURNIN_WIFI_TCP_SEC` | TCP 单轮测试时长 |
+| `BURNIN_WIFI_GAP_SEC` | 每轮 WiFi 测试结束前保留的空档，防止命令跨轮次堆积 |
+| `BURNIN_WIFI_START_GRACE_SEC` | 每轮开始后允许下发 WiFi 命令的时间窗 |
 | `BURNIN_WIFI_TCP_PARALLEL` | TCP 多流并发数 |
 | `BURNIN_IPERF3_PORT` | iperf3 服务端口 |
 | `BURNIN_WIFI_UDP_FLOOD_BANDWIDTH` | UDP 满载目标上限 |
@@ -283,9 +285,13 @@ journalctl -u tspi-burnin-agent.service -f
 - `wlan0` 有 IPv4。
 - WiFi 已连接。
 - 到对端 WiFi IP 的路由走 `wlan0`。
+- 通过 `wlan0` 对 WiFi 网关做一次快速 ping 预检。
+- iperf 前会通过 `wlan0` 对对端 WiFi IP 做一次快速 ping 预检。
 - iperf3 客户端绑定到 `wlan0`。
 
-结果里会带 `wifi_path_ok`、`route_dev`、`bound_dev` 等字段，用于确认流量确实走 WiFi。
+结果里会带 `wifi_path_ok`、`route_dev`、`bound_dev`、`gateway_ping_ok`、`peer_ping_ok`、`preflight_failure` 等字段，用于确认流量确实走 WiFi，并快速区分路由错误、本机 WiFi 数据面异常和对端 WiFi 数据面不可达。本机到 WiFi 网关失败时，agent 会通过 NetworkManager 自动重连 `wlan0` 后重试预检。
+
+WiFi iperf 类测试采用单发起端轮转：每个 epoch 只让一块板作为客户端发起，其他板保持 iperf3 server 接收或回传。`wifi_tcp_bidir`、`wifi_tcp_reverse` 和 UDP 轮次仍会覆盖双向链路，但避免两块板同时互相发起导致 iperf3 控制连接卡死。
 
 ### UDP
 
@@ -295,6 +301,8 @@ UDP 支持自适应速率。流程是：
 2. 选择丢包率不超过 `BURNIN_WIFI_UDP_ADAPTIVE_MAX_LOSS_PERCENT` 的最高速率。
 3. 如果全部超过阈值，选择丢包最低的速率。
 4. 用选择后的速率跑正式测试。
+
+UDP 探测和正式测试共享单轮总时限。低速探测已经超时或没有返回 JSON 时，会停止继续尝试更高速率，避免一条失败命令占住多个 WiFi 轮次。
 
 UDP 丢包率是 iperf3 的 `lost_percent`。
 

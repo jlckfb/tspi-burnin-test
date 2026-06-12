@@ -32,15 +32,15 @@ class Settings:
     wifi_tcp_sec = int(os.environ.get("BURNIN_WIFI_TCP_SEC", "300"))
     wifi_gap_sec = int(os.environ.get("BURNIN_WIFI_GAP_SEC", "5"))
     wifi_start_grace_sec = int(os.environ.get("BURNIN_WIFI_START_GRACE_SEC", "8"))
-    wifi_tcp_parallel = int(os.environ.get("BURNIN_WIFI_TCP_PARALLEL", "4"))
+    wifi_tcp_parallel = int(os.environ.get("BURNIN_WIFI_TCP_PARALLEL", "2"))
     wifi_udp_bandwidth = os.environ.get("BURNIN_WIFI_UDP_BANDWIDTH", "0")
-    wifi_udp_flood_bandwidth = os.environ.get("BURNIN_WIFI_UDP_FLOOD_BANDWIDTH", "200M")
-    wifi_udp_small_bandwidth = os.environ.get("BURNIN_WIFI_UDP_SMALL_BANDWIDTH", "60M")
-    wifi_udp_large_bandwidth = os.environ.get("BURNIN_WIFI_UDP_LARGE_BANDWIDTH", "120M")
-    wifi_udp_flood_rates = os.environ.get("BURNIN_WIFI_UDP_FLOOD_RATES", "50M,100M,150M,200M")
-    wifi_udp_small_rates = os.environ.get("BURNIN_WIFI_UDP_SMALL_RATES", "5M,10M,20M,30M,40M,60M")
-    wifi_udp_large_rates = os.environ.get("BURNIN_WIFI_UDP_LARGE_RATES", "30M,60M,90M,120M,160M,200M")
-    wifi_udp_adaptive_probe_sec = int(os.environ.get("BURNIN_WIFI_UDP_ADAPTIVE_PROBE_SEC", "5"))
+    wifi_udp_flood_bandwidth = os.environ.get("BURNIN_WIFI_UDP_FLOOD_BANDWIDTH", "8M")
+    wifi_udp_small_bandwidth = os.environ.get("BURNIN_WIFI_UDP_SMALL_BANDWIDTH", "2M")
+    wifi_udp_large_bandwidth = os.environ.get("BURNIN_WIFI_UDP_LARGE_BANDWIDTH", "5M")
+    wifi_udp_flood_rates = os.environ.get("BURNIN_WIFI_UDP_FLOOD_RATES", "1M,2M,5M,8M")
+    wifi_udp_small_rates = os.environ.get("BURNIN_WIFI_UDP_SMALL_RATES", "512K,1M,2M")
+    wifi_udp_large_rates = os.environ.get("BURNIN_WIFI_UDP_LARGE_RATES", "1M,2M,5M")
+    wifi_udp_adaptive_probe_sec = int(os.environ.get("BURNIN_WIFI_UDP_ADAPTIVE_PROBE_SEC", "3"))
     wifi_udp_adaptive_max_loss_percent = float(os.environ.get("BURNIN_WIFI_UDP_ADAPTIVE_MAX_LOSS_PERCENT", "5"))
     wifi_udp_min_sec = int(os.environ.get("BURNIN_WIFI_UDP_MIN_SEC", "10"))
     iperf3_port = int(os.environ.get("BURNIN_IPERF3_PORT", "5201"))
@@ -141,6 +141,15 @@ def dashboard_result(item: dict[str, Any]) -> dict[str, Any]:
         "local_wifi_ip",
         "route_dev",
         "bound_dev",
+        "gateway_ip",
+        "gateway_ping_ok",
+        "peer_ping_ok",
+        "preflight_failure",
+        "wifi_recovered",
+        "wifi_recovery_error",
+        "packets_transmitted",
+        "packets_received",
+        "packet_loss_percent",
         "iperf3_attempts",
         "iperf3_retry_reason",
         "iperf3_nonfatal_error",
@@ -244,14 +253,20 @@ def classify_failure(item: dict[str, Any], reason: str) -> str:
     summary = item.get("summary") if isinstance(item.get("summary"), dict) else {}
     if summary.get("udp_loss_exceeded") or "udp loss" in text:
         return "udp_loss"
+    if "gateway_ping_failed" in str(summary.get("preflight_failure") or "") or "gateway_ping_failed" in text:
+        return "wifi_data_plane_down"
+    if "peer_ping_failed" in str(summary.get("preflight_failure") or "") or "peer_ping_failed" in text:
+        return "wifi_peer_unreachable"
+    if item.get("type") == "wifi_ping" and number_or_none(summary.get("packet_loss_percent")) == 100.0:
+        return "wifi_loss"
     if "lost_during_command" in text or "offline" in text:
         return "board_offline"
     if "server is busy" in text:
         return "iperf3_busy"
-    if "connection reset" in text or "resource temporarily unavailable" in text:
+    if "timeout" in text and str(item.get("type") or "").startswith("wifi_"):
+        return "iperf3_timeout"
+    if "connection reset" in text or "resource temporarily unavailable" in text or "unable to write to stream socket" in text:
         return "iperf3_control"
-    if "100.0" in text and item.get("type") == "wifi_ping":
-        return "wifi_loss"
     if "btmgmt" in text or "hcitool" in text or "timeout" in text and str(item.get("type") or "").startswith("bt_"):
         return "bt_mgmt_timeout"
     if "host is down" in text or "can't connect" in text:
@@ -1815,9 +1830,11 @@ def compute_commands(board_id: str) -> list[dict[str, Any]]:
         remaining_sec = epoch_end_sec - now_sec
         peer = peer_for_epoch(boards, index, epoch)
         mode = wifi_mode_for_epoch(epoch)
+        mode_type = str(mode.get("type") or "")
         should_start_wifi = (
             elapsed_sec <= max(1, settings.wifi_start_grace_sec)
             and remaining_sec > max(5, settings.wifi_gap_sec + 5)
+            and wifi_should_initiate(mode_type, index, epoch, len(boards))
         )
         if peer and should_start_wifi:
             duration_sec = min(
@@ -1831,6 +1848,8 @@ def compute_commands(board_id: str) -> list[dict[str, Any]]:
                 "peer_ip": peer["wifi_ip"],
                 "port": settings.iperf3_port,
                 "duration_sec": duration_sec,
+                "initiator_index": index,
+                "initiator_count": len(boards),
             }
             command.update({key: value for key, value in mode.items() if key not in {"type", "duration_sec"}})
             commands_out.append(command)
@@ -1847,6 +1866,16 @@ def peer_for_epoch(boards: list[dict[str, Any]], index: int, epoch: int) -> dict
         return None
     offset = 1 + (epoch % (len(boards) - 1))
     return boards[(index + offset) % len(boards)]
+
+
+def wifi_should_initiate(mode_type: str, board_index: int, epoch: int, board_count: int) -> bool:
+    if board_count <= 1:
+        return False
+    if mode_type == "wifi_ping":
+        return True
+    if mode_type.startswith("wifi_"):
+        return board_index == (epoch % board_count)
+    return False
 
 
 def wifi_mode_for_epoch(epoch: int) -> dict[str, Any]:

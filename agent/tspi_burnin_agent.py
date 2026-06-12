@@ -60,6 +60,9 @@ DEFAULT_CONFIG = {
     "btmon_capture_sec": 4,
 }
 
+IPERF3_TIMEOUT_MARGIN_SEC = 5
+IPERF3_RETRY_DELAY_SEC = 3
+
 
 def now_ms() -> int:
     return int(time.time() * 1000)
@@ -977,8 +980,19 @@ class CommandRunner:
         port = int(command.get("port", self.config["iperf3_port"]))
         duration = int(command.get("duration_sec", 60))
         command_type = str(command.get("type") or "")
-        preflight = self.wifi_preflight(peer_ip)
+        preflight = self.wifi_preflight(peer_ip, check_peer=True)
+        recovery_result: dict[str, Any] | None = None
+        recovered_wifi = False
+        recoverable_failures = {"missing_wifi_ip", "wifi_not_connected", "gateway_ping_failed"}
+        if not preflight["ok"] and recoverable_failures.intersection(set(preflight.get("failures", []))):
+            recovery_result = recover_wifi_data_plane(str(self.config["wifi_interface"]))
+            recovered_wifi = bool(recovery_result.get("ok"))
+            preflight = self.wifi_preflight(peer_ip, check_peer=True)
+        preflight_summary = wifi_preflight_summary(preflight, str(self.config["wifi_interface"]))
+        preflight_summary["wifi_recovered"] = recovered_wifi
+        preflight_summary["wifi_recovery_error"] = "" if not recovery_result else str(recovery_result.get("error") or "")
         if not preflight["ok"]:
+            reason = str(preflight_summary.get("preflight_failure") or "wifi_preflight_failed")
             return {
                 "command_id": command.get("id"),
                 "type": command_type,
@@ -987,8 +1001,9 @@ class CommandRunner:
                 "finished_at_ms": now_ms(),
                 "peer_ip": peer_ip,
                 "preflight": preflight,
-                "summary": {"wifi_path_ok": False},
-                "error": "wifi preflight failed",
+                "summary": preflight_summary,
+                "error": f"wifi preflight failed: {reason}",
+                "raw": {"wifi_recovery": recovery_result} if recovery_result else None,
             }
         local_ip = str(preflight["local_wifi_ip"])
         started = now_ms()
@@ -1002,6 +1017,8 @@ class CommandRunner:
                 udp_length = udp_length or 256
             elif command_type == "wifi_udp_large":
                 udp_length = udp_length or 1400
+        command_started = time.monotonic()
+        command_deadline = command_started + max(10, duration + IPERF3_TIMEOUT_MARGIN_SEC)
 
         def build_args(test_duration: int, bandwidth: str | None = None) -> list[str]:
             args = [*base_args, "-t", str(max(1, int(test_duration)))]
@@ -1019,14 +1036,32 @@ class CommandRunner:
                     args.extend(["-l", str(udp_length)])
             return args
 
+        def remaining_budget_sec() -> float:
+            return max(0.0, command_deadline - time.monotonic())
+
         def run_iperf3_json(test_args: list[str], test_duration: int) -> tuple[dict[str, Any], Any, int, str]:
             result: dict[str, Any] = {}
             parsed = None
             retry_reason = ""
             attempts = 0
             for attempt in range(1, 4):
+                remaining = remaining_budget_sec()
+                if remaining <= 1:
+                    return (
+                        {
+                            "ok": False,
+                            "returncode": 124,
+                            "stdout": "",
+                            "stderr": "iperf3 command budget exhausted",
+                            "duration_ms": 0,
+                        },
+                        None,
+                        attempts,
+                        retry_reason,
+                    )
                 attempts = attempt
-                result = run_cmd(test_args, timeout=max(10, int(test_duration) + 30))
+                timeout = max(1, min(float(test_duration) + IPERF3_TIMEOUT_MARGIN_SEC, remaining))
+                result = run_cmd(test_args, timeout=timeout)
                 parsed = None
                 if result["stdout"]:
                     try:
@@ -1034,10 +1069,15 @@ class CommandRunner:
                     except json.JSONDecodeError:
                         parsed = None
                 raw_error = str(parsed.get("error") or "") if isinstance(parsed, dict) else ""
+                if result.get("returncode") == 124:
+                    break
                 if result["ok"] or "server is busy" not in raw_error.lower() or attempt == 3:
                     break
                 retry_reason = raw_error
-                time.sleep(10)
+                delay = min(float(IPERF3_RETRY_DELAY_SEC), max(0.0, remaining_budget_sec() - 1))
+                if delay <= 0:
+                    break
+                time.sleep(delay)
             return result, parsed, attempts, retry_reason
 
         selected_bandwidth = str(command.get("bandwidth", "0"))
@@ -1045,15 +1085,18 @@ class CommandRunner:
         adaptive_max_loss = float(command.get("adaptive_max_loss_percent", 5) or 5)
         adaptive_probe_sec = max(1, int(command.get("adaptive_probe_sec", 5) or 5))
         adaptive_enabled = bool(command.get("adaptive")) and is_udp
-        command_started = time.monotonic()
+        last_probe_result: dict[str, Any] | None = None
         if adaptive_enabled:
             rates = parse_rate_list(command.get("adaptive_rates"), selected_bandwidth)
             best_ok_rate = ""
             lowest_loss_rate = ""
             lowest_loss_value: float | None = None
             for rate in rates:
+                if remaining_budget_sec() <= adaptive_probe_sec + 1:
+                    break
                 probe_args = build_args(adaptive_probe_sec, rate)
                 probe_result, probe_parsed, probe_attempts, _probe_retry_reason = run_iperf3_json(probe_args, adaptive_probe_sec)
+                last_probe_result = probe_result
                 probe_summary = summarize_iperf3(probe_parsed)
                 loss = number_or_none(probe_summary.get("lost_percent"))
                 adaptive_probe_summary.append(
@@ -1065,7 +1108,12 @@ class CommandRunner:
                         "bits_per_second": probe_summary.get("bits_per_second"),
                         "returncode": probe_result.get("returncode"),
                         "attempts": probe_attempts,
-                        "error": (probe_parsed or {}).get("error") if isinstance(probe_parsed, dict) else "",
+                        "error": str(
+                            ((probe_parsed or {}).get("error") if isinstance(probe_parsed, dict) else None)
+                            or probe_result.get("stderr")
+                            or probe_result.get("stdout")
+                            or ""
+                        )[:240],
                     }
                 )
                 if loss is not None and (lowest_loss_value is None or loss < lowest_loss_value):
@@ -1073,14 +1121,40 @@ class CommandRunner:
                     lowest_loss_rate = rate
                 if probe_result["ok"] and probe_parsed and loss is not None and loss <= adaptive_max_loss:
                     best_ok_rate = rate
+                if probe_result.get("returncode") == 124 or not probe_parsed:
+                    break
             selected_bandwidth = best_ok_rate or lowest_loss_rate or (rates[0] if rates else selected_bandwidth)
 
         elapsed_sec = int(time.monotonic() - command_started)
-        final_duration = duration
+        final_duration = max(1, duration)
+        parsed: Any = None
         if adaptive_enabled:
-            final_duration = max(30, duration - elapsed_sec - 5)
+            final_budget = int(remaining_budget_sec() - IPERF3_TIMEOUT_MARGIN_SEC)
+            final_duration = max(1, min(duration - elapsed_sec, final_budget))
         args = build_args(final_duration, selected_bandwidth if is_udp else None)
-        result, parsed, attempts, retry_reason = run_iperf3_json(args, final_duration)
+        no_valid_udp_probe = bool(
+            adaptive_enabled
+            and adaptive_probe_summary
+            and all(item.get("lost_percent") is None for item in adaptive_probe_summary)
+        )
+        if no_valid_udp_probe or final_duration <= 0:
+            probe_error = ""
+            if adaptive_probe_summary:
+                probe_error = str(adaptive_probe_summary[-1].get("error") or "")
+            error_text = probe_error or "udp adaptive probes failed"
+            result = dict(last_probe_result or {
+                "ok": False,
+                "returncode": 124,
+                "stdout": "",
+                "stderr": error_text,
+                "duration_ms": int((time.monotonic() - command_started) * 1000),
+            })
+            result["ok"] = False
+            parsed = {"error": error_text, "adaptive_probes": adaptive_probe_summary}
+            attempts = 0
+            retry_reason = ""
+        else:
+            result, parsed, attempts, retry_reason = run_iperf3_json(args, final_duration)
         summary = summarize_iperf3(parsed)
         probe_text = ", ".join(
             f"{item['bandwidth']}:{'-' if item.get('lost_percent') is None else round(float(item['lost_percent']), 1)}%"
@@ -1088,14 +1162,13 @@ class CommandRunner:
         )
         summary.update(
             {
-                "wifi_path_ok": preflight["ok"],
-                "local_wifi_ip": local_ip,
-                "route_dev": preflight.get("route_dev"),
+                **preflight_summary,
                 "bound_dev": self.config["wifi_interface"],
                 "iperf3_attempts": attempts,
                 "iperf3_retry_reason": retry_reason,
                 "udp_bandwidth": selected_bandwidth if is_udp else "",
                 "udp_length": udp_length if is_udp else None,
+                "duration_sec": final_duration,
                 "adaptive_udp": adaptive_enabled,
                 "adaptive_selected_bandwidth": selected_bandwidth if adaptive_enabled else "",
                 "adaptive_probe_sec": adaptive_probe_sec if adaptive_enabled else None,
@@ -1138,35 +1211,77 @@ class CommandRunner:
     def run_wifi_ping(self, command: dict[str, Any]) -> dict[str, Any]:
         peer_ip = str(command["peer_ip"])
         count = int(command.get("count", 20))
-        preflight = self.wifi_preflight(peer_ip)
+        preflight = self.wifi_preflight(peer_ip, check_peer=True)
+        recovery_result: dict[str, Any] | None = None
+        recovered_wifi = False
+        recoverable_failures = {"missing_wifi_ip", "wifi_not_connected", "gateway_ping_failed"}
+        if not preflight["ok"] and recoverable_failures.intersection(set(preflight.get("failures", []))):
+            recovery_result = recover_wifi_data_plane(str(self.config["wifi_interface"]))
+            recovered_wifi = bool(recovery_result.get("ok"))
+            preflight = self.wifi_preflight(peer_ip, check_peer=True)
+        preflight_summary = wifi_preflight_summary(preflight, str(self.config["wifi_interface"]))
+        preflight_summary["wifi_recovered"] = recovered_wifi
+        preflight_summary["wifi_recovery_error"] = "" if not recovery_result else str(recovery_result.get("error") or "")
         args = ["ping", "-I", str(self.config["wifi_interface"]), "-c", str(count), "-W", "2", peer_ip]
         started = now_ms()
         result = run_cmd(args, timeout=max(10, count * 3))
         summary = parse_ping_summary(result["stdout"])
-        summary.update({"wifi_path_ok": preflight["ok"], "route_dev": preflight.get("route_dev")})
+        summary.update(preflight_summary)
+        status = "passed" if result["ok"] else "failed"
+        loss = summary.get("packet_loss_percent")
+        error = ""
+        if status != "passed":
+            error = f"wifi ping failed: {loss}% packet loss" if loss is not None else "wifi ping failed"
         return {
             "command_id": command.get("id"),
             "type": command.get("type"),
-            "status": "passed" if result["ok"] else "failed",
+            "status": status,
             "started_at_ms": started,
             "finished_at_ms": now_ms(),
             "peer_ip": peer_ip,
             "preflight": preflight,
             "args": redact_args(args),
             "returncode": result["returncode"],
+            "error": error,
+            "stderr": result["stderr"][-4096:],
             "summary": summary,
-            "raw": {"stdout": result["stdout"][-4096:], "stderr": result["stderr"][-4096:]},
+            "raw": {"stdout": result["stdout"][-4096:], "stderr": result["stderr"][-4096:], "wifi_recovery": recovery_result},
         }
 
-    def wifi_preflight(self, peer_ip: str) -> dict[str, Any]:
+    def wifi_preflight(self, peer_ip: str, check_peer: bool = False) -> dict[str, Any]:
         iface = str(self.config["wifi_interface"])
         local_ip = iface_ipv4(iface)
         link = run_cmd(["iw", "dev", iface, "link"], timeout=3)
         route = run_cmd(["ip", "route", "get", peer_ip, "from", local_ip or "0.0.0.0"], timeout=3)
         route_dev = parse_route_dev(route["stdout"])
-        ok = bool(local_ip) and "Connected to" in link["stdout"] and route["ok"] and route_dev == iface
+        failures = []
+        if not local_ip:
+            failures.append("missing_wifi_ip")
+        if "Connected to" not in link["stdout"]:
+            failures.append("wifi_not_connected")
+        if not route["ok"] or route_dev != iface:
+            failures.append("route_not_wlan0")
+        gateway_ip = wifi_gateway_ip(iface)
+        gateway_ping_ok: bool | None = None
+        gateway_ping_raw = ""
+        if gateway_ip and not failures:
+            gateway_ping = run_cmd(["ping", "-I", iface, "-c", "1", "-W", "1", gateway_ip], timeout=3)
+            gateway_ping_ok = bool(gateway_ping["ok"])
+            gateway_ping_raw = (gateway_ping["stdout"] or gateway_ping["stderr"])[-2048:]
+            if not gateway_ping_ok:
+                failures.append("gateway_ping_failed")
+        peer_ping_ok: bool | None = None
+        peer_ping_raw = ""
+        if check_peer and not failures:
+            peer_ping = run_cmd(["ping", "-I", iface, "-c", "1", "-W", "1", peer_ip], timeout=3)
+            peer_ping_ok = bool(peer_ping["ok"])
+            peer_ping_raw = (peer_ping["stdout"] or peer_ping["stderr"])[-2048:]
+            if not peer_ping_ok:
+                failures.append("peer_ping_failed")
+        ok = not failures
         return {
             "ok": ok,
+            "failures": failures,
             "wifi_interface": iface,
             "local_wifi_ip": local_ip,
             "peer_ip": peer_ip,
@@ -1174,6 +1289,11 @@ class CommandRunner:
             "route_raw": route["stdout"][-2048:],
             "link_connected": "Connected to" in link["stdout"],
             "link_raw": link["stdout"][-2048:],
+            "gateway_ip": gateway_ip,
+            "gateway_ping_ok": gateway_ping_ok,
+            "gateway_ping_raw": gateway_ping_raw,
+            "peer_ping_ok": peer_ping_ok,
+            "peer_ping_raw": peer_ping_raw,
         }
 
     def run_bt_ble(self, command: dict[str, Any]) -> dict[str, Any]:
@@ -1439,6 +1559,72 @@ def parse_route_dev(output: str) -> str | None:
     return match.group(1) if match else None
 
 
+def wifi_gateway_ip(iface: str) -> str:
+    result = run_cmd(["ip", "route", "show", "default", "dev", iface], timeout=3)
+    match = re.search(r"\bvia\s+(\S+)", result["stdout"])
+    return match.group(1) if match else ""
+
+
+def active_nm_connection(iface: str) -> str:
+    result = run_cmd(["nmcli", "-t", "-f", "GENERAL.CONNECTION", "device", "show", iface], timeout=3)
+    if not result["ok"]:
+        return ""
+    for line in result["stdout"].splitlines():
+        if line.startswith("GENERAL.CONNECTION:"):
+            value = line.split(":", 1)[1].strip()
+            return "" if value in {"", "--"} else value
+    return ""
+
+
+def recover_wifi_data_plane(iface: str) -> dict[str, Any]:
+    started = now_ms()
+    connection = active_nm_connection(iface)
+    steps: list[dict[str, Any]] = []
+    steps.append({"cmd": f"nmcli device disconnect {iface}", "result": run_cmd(["nmcli", "device", "disconnect", iface], timeout=8)})
+    time.sleep(3)
+    if connection:
+        up_args = ["nmcli", "connection", "up", connection, "ifname", iface]
+    else:
+        up_args = ["nmcli", "device", "connect", iface]
+    steps.append({"cmd": " ".join(up_args), "result": run_cmd(up_args, timeout=20)})
+    deadline = time.monotonic() + 12
+    local_ip = ""
+    link_connected = False
+    while time.monotonic() < deadline:
+        local_ip = iface_ipv4(iface)
+        link = run_cmd(["iw", "dev", iface, "link"], timeout=3)
+        link_connected = "Connected to" in link["stdout"]
+        if local_ip and link_connected:
+            break
+        time.sleep(1)
+    ok = bool(local_ip and link_connected and steps[-1]["result"].get("ok"))
+    error = "" if ok else str(steps[-1]["result"].get("stderr") or steps[-1]["result"].get("stdout") or "wifi reconnect failed")
+    return {
+        "ok": ok,
+        "interface": iface,
+        "connection": connection,
+        "local_wifi_ip": local_ip,
+        "link_connected": link_connected,
+        "duration_ms": now_ms() - started,
+        "error": error[-500:],
+        "steps": steps,
+    }
+
+
+def wifi_preflight_summary(preflight: dict[str, Any], iface: str) -> dict[str, Any]:
+    failures = preflight.get("failures") if isinstance(preflight.get("failures"), list) else []
+    return {
+        "wifi_path_ok": bool(preflight.get("ok")),
+        "local_wifi_ip": preflight.get("local_wifi_ip"),
+        "route_dev": preflight.get("route_dev"),
+        "bound_dev": iface,
+        "gateway_ip": preflight.get("gateway_ip"),
+        "gateway_ping_ok": preflight.get("gateway_ping_ok"),
+        "peer_ping_ok": preflight.get("peer_ping_ok"),
+        "preflight_failure": ",".join(str(item) for item in failures if item),
+    }
+
+
 def redact_args(args: list[str]) -> list[str]:
     return [str(item) for item in args]
 
@@ -1516,9 +1702,17 @@ def classify_failure_for_agent(result: dict[str, Any], reason: str) -> str:
     summary = result.get("summary") if isinstance(result.get("summary"), dict) else {}
     if summary.get("udp_loss_exceeded") or "udp loss" in text:
         return "udp_loss"
+    if "gateway_ping_failed" in str(summary.get("preflight_failure") or "") or "gateway_ping_failed" in text:
+        return "wifi_data_plane_down"
+    if "peer_ping_failed" in str(summary.get("preflight_failure") or "") or "peer_ping_failed" in text:
+        return "wifi_peer_unreachable"
+    if str(result.get("type") or "") == "wifi_ping" and number_or_none(summary.get("packet_loss_percent")) == 100.0:
+        return "wifi_loss"
     if "server is busy" in text:
         return "iperf3_busy"
-    if "connection reset" in text or "resource temporarily unavailable" in text:
+    if "timeout" in text and str(result.get("type") or "").startswith("wifi_"):
+        return "iperf3_timeout"
+    if "connection reset" in text or "resource temporarily unavailable" in text or "unable to write to stream socket" in text:
         return "iperf3_control"
     if "btmgmt" in text or "hcitool" in text or ("timeout" in text and str(result.get("type") or "").startswith("bt_")):
         return "bt_mgmt_timeout"
@@ -1564,8 +1758,18 @@ def dashboard_result_for_agent(result: dict[str, Any]) -> dict[str, Any]:
                 "lost_percent",
                 "retransmits",
                 "wifi_path_ok",
+                "local_wifi_ip",
                 "route_dev",
                 "bound_dev",
+                "gateway_ip",
+                "gateway_ping_ok",
+                "peer_ping_ok",
+                "preflight_failure",
+                "wifi_recovered",
+                "wifi_recovery_error",
+                "packets_transmitted",
+                "packets_received",
+                "packet_loss_percent",
                 "adaptive_selected_bandwidth",
                 "adaptive_probe_summary",
                 "udp_max_loss_percent",
