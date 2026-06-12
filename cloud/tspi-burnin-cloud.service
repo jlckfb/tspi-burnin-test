@@ -1,0 +1,18 @@
+[Unit]
+Description=TaishanPi burn-in cloud server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/tspi-burnin-cloud.env
+WorkingDirectory=/opt/tspi-burnin-cloud
+ExecStart=/opt/tspi-burnin-cloud/.venv/bin/uvicorn server:app --host 0.0.0.0 --port ${BURNIN_LISTEN_PORT}
+Restart=always
+RestartSec=3
+User=root
+Group=root
+StateDirectory=tspi-burnin-cloud
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,7 @@
+build/
+dist/
+packaging/local.env
+config/tspi-burnin.env
+cloud/.env
+__pycache__/
+*.pyc

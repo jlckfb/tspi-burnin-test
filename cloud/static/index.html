@@ -1,0 +1,303 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>泰山派老化测试</title>
+    <link rel="stylesheet" href="static/styles.css" />
+  </head>
+  <body data-dashboard-mode="admin">
+    <main class="shell">
+      <header class="topbar">
+        <div>
+          <div class="title-row">
+            <h1>泰山派老化测试</h1>
+            <span class="mode-badge" id="mode-badge">主看板</span>
+          </div>
+          <p id="clock">等待数据</p>
+        </div>
+        <div class="summary-strip" aria-label="测试概览">
+          <div><span id="online-count">0</span><small>在线</small></div>
+          <div><span id="board-count">0</span><small>板卡</small></div>
+          <div><span id="fail-count">0</span><small>异常</small></div>
+          <div><span id="max-temp-count">-</span><small>最高温</small></div>
+          <div><span id="artifact-count">0</span><small>取证</small></div>
+          <div><span id="progress-count">0%</span><small>进度</small></div>
+        </div>
+      </header>
+
+      <section class="plan-grid">
+        <article class="plan-card">
+          <span>测试状态</span>
+          <strong id="schedule-status">等待数据</strong>
+          <small id="connection-state">连接中</small>
+        </article>
+        <article class="plan-card">
+          <span>开始时间</span>
+          <strong id="schedule-start">-</strong>
+          <small>TEST_START</small>
+        </article>
+        <article class="plan-card">
+          <span>截止时间</span>
+          <strong id="schedule-end">-</strong>
+          <small id="schedule-remaining">-</small>
+        </article>
+        <article class="plan-card">
+          <span>WiFi 轮转</span>
+          <strong id="schedule-wifi">-</strong>
+          <small id="schedule-wifi-detail">-</small>
+        </article>
+        <article class="plan-card">
+          <span>蓝牙轮转</span>
+          <strong id="schedule-bt">-</strong>
+          <small>BLE / BR-EDR / L2CAP</small>
+        </article>
+      </section>
+
+      <!-- ADMIN_PANEL_START -->
+      <section class="admin-panel admin-only" id="admin-panel">
+        <div class="admin-copy">
+          <h2>管理操作</h2>
+          <span>设置老化时间、清除历史、删除注册板卡</span>
+          <p id="admin-status">等待操作</p>
+        </div>
+        <div class="admin-block">
+          <div class="admin-block-head">
+            <h3>老化时间</h3>
+            <span>控制测试命令下发窗口</span>
+          </div>
+          <div class="schedule-editor">
+            <label>
+              <span>开始时间</span>
+              <input id="schedule-start-input" type="datetime-local" />
+            </label>
+            <label>
+              <span>截止时间</span>
+              <input id="schedule-end-input" type="datetime-local" />
+            </label>
+            <div class="button-row">
+              <button id="save-schedule-btn" type="button">保存时间</button>
+              <button id="quick-7d-btn" type="button">现在起 7 天</button>
+              <button id="clear-schedule-btn" type="button">清除时间限制</button>
+            </div>
+          </div>
+        </div>
+        <div class="admin-block">
+          <div class="admin-block-head">
+            <h3>数据维护</h3>
+            <span>清理历史和注册板卡</span>
+          </div>
+          <div class="admin-actions">
+            <button id="clear-history-btn" type="button">清除历史数据</button>
+            <select id="delete-board-id" aria-label="选择要删除的板卡"></select>
+            <label class="checkbox-row">
+              <input id="delete-board-history" type="checkbox" checked />
+              <span>同时删除该板历史</span>
+            </label>
+            <button id="delete-board-btn" type="button">删除板卡</button>
+          </div>
+        </div>
+      </section>
+      <!-- ADMIN_PANEL_END -->
+
+      <section>
+        <div class="section-head">
+          <h2>数据总览</h2>
+          <span id="overview-summary">-</span>
+        </div>
+        <div class="overview-grid">
+          <article class="overview-card">
+            <span>累计测试</span>
+            <strong id="overview-total">0</strong>
+            <small id="overview-window">-</small>
+          </article>
+          <article class="overview-card">
+            <span>通过</span>
+            <strong id="overview-passed">0</strong>
+            <small id="overview-pass-rate">-</small>
+          </article>
+          <article class="overview-card">
+            <span>异常</span>
+            <strong id="overview-failed">0</strong>
+            <small id="overview-failed-24h">-</small>
+          </article>
+          <article class="overview-card">
+            <span>WiFi 测试</span>
+            <strong id="overview-wifi">0</strong>
+            <small id="overview-wifi-detail">-</small>
+          </article>
+          <article class="overview-card">
+            <span>蓝牙测试</span>
+            <strong id="overview-bt">0</strong>
+            <small id="overview-bt-detail">-</small>
+          </article>
+          <article class="overview-card">
+            <span>TCP 重传率</span>
+            <strong id="overview-tcp-retransmits">-</strong>
+            <small id="overview-tcp-retransmit-detail">-</small>
+          </article>
+          <article class="overview-card">
+            <span>UDP 丢包</span>
+            <strong id="overview-udp-loss">-</strong>
+            <small id="overview-udp-loss-detail">-</small>
+          </article>
+          <article class="overview-card">
+            <span>指标采样</span>
+            <strong id="overview-metrics">0</strong>
+            <small id="overview-logs">-</small>
+          </article>
+          <article class="overview-card">
+            <span>取证文件</span>
+            <strong id="overview-artifacts">0</strong>
+            <small>启动 / 崩溃 / 异常附件</small>
+          </article>
+        </div>
+        <div class="panel overview-detail">
+          <div class="panel-head">
+            <h2>类型统计</h2>
+            <span id="overview-type-summary">-</span>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>测试类型</th>
+                  <th>累计</th>
+                  <th>通过</th>
+                  <th>异常</th>
+                  <th>异常率</th>
+                  <th>最近结果</th>
+                </tr>
+              </thead>
+              <tbody id="overview-types"></tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+      <section>
+        <div class="section-head">
+          <h2>板卡健康</h2>
+          <span id="board-summary">-</span>
+        </div>
+        <div class="board-grid" id="boards"></div>
+      </section>
+
+      <section class="workbench">
+        <div class="panel wide-panel">
+          <div class="panel-head">
+            <h2>单板明细</h2>
+            <span>系统 / 网络 / 温度 / 最近上报</span>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>板卡</th>
+                  <th>状态</th>
+                  <th>主机</th>
+                  <th>有线 IP</th>
+                  <th>WiFi IP</th>
+                  <th>温度</th>
+                  <th>负载</th>
+                  <th>内存</th>
+                  <th>运行时长</th>
+                  <th>最近上报</th>
+                </tr>
+              </thead>
+              <tbody id="board-table"></tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+      <section class="workbench">
+        <div class="panel">
+          <div class="panel-head">
+            <h2>WiFi 观测</h2>
+            <span>wlan0 压测链路</span>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>板卡</th>
+                  <th>连接</th>
+                  <th>SSID / BSSID</th>
+                  <th>信号</th>
+                  <th>发射功率</th>
+                  <th>链路速率</th>
+                  <th>实时流量</th>
+                  <th>错误</th>
+                </tr>
+              </thead>
+              <tbody id="wifi-table"></tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+      <section class="workbench">
+        <div class="panel">
+          <div class="panel-head">
+            <h2>蓝牙观测</h2>
+            <span>AP6256 BT 控制器</span>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>板卡</th>
+                  <th>控制器</th>
+                  <th>状态</th>
+                  <th>BT MAC</th>
+                  <th>接收</th>
+                  <th>发送</th>
+                  <th>错误</th>
+                </tr>
+              </thead>
+              <tbody id="bt-table"></tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+      <section class="workbench recent-section">
+        <div class="panel results-panel">
+          <div class="panel-head">
+            <h2>最近测试结果</h2>
+            <span id="result-summary">-</span>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>时间</th>
+                  <th>板卡</th>
+                  <th>类型</th>
+                  <th>状态</th>
+                  <th>对端</th>
+                  <th>吞吐</th>
+                  <th>丢包/重传</th>
+                  <th>摘要</th>
+                </tr>
+              </thead>
+              <tbody id="results"></tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+      <section class="workbench recent-section">
+        <div class="panel log-panel">
+          <div class="panel-head">
+            <h2>最近日志</h2>
+            <span id="log-summary">-</span>
+          </div>
+          <div class="log-list" id="logs"></div>
+        </div>
+      </section>
+    </main>
+    <script src="static/app.js"></script>
+  </body>
+</html>

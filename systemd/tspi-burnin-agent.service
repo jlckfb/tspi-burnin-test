@@ -1,0 +1,21 @@
+[Unit]
+Description=TaishanPi burn-in board agent
+After=network-online.target bluetooth.service tspi-burnin-iperf3.service
+Wants=network-online.target bluetooth.service tspi-burnin-iperf3.service
+
+[Service]
+Type=notify
+ExecStart=/usr/bin/python3 /opt/tspi-burnin/agent/tspi_burnin_agent.py /etc/tspi-burnin/config.toml
+Restart=always
+RestartSec=3
+User=root
+Group=root
+WorkingDirectory=/var/lib/tspi-burnin
+WatchdogSec=45
+NotifyAccess=main
+RuntimeDirectory=tspi-burnin
+StateDirectory=tspi-burnin
+LogsDirectory=tspi-burnin
+
+[Install]
+WantedBy=multi-user.target

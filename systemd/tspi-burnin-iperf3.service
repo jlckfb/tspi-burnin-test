@@ -1,0 +1,15 @@
+[Unit]
+Description=iperf3 server for TaishanPi WiFi burn-in
+After=network-online.target NetworkManager.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/bin/sh -c 'while :; do IP=$(/usr/sbin/ip -4 -o addr show dev wlan0 scope global | /usr/bin/sed -n "s/.* inet \\([^/]*\\).*/\\1/p" | /usr/bin/head -n1); if [ -n "$IP" ]; then /usr/bin/iperf3 -s -p 5201 -B "$IP"; else sleep 2; fi; done'
+Restart=always
+RestartSec=2
+User=root
+Group=root
+
+[Install]
+WantedBy=multi-user.target

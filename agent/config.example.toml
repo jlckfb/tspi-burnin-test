@@ -1,0 +1,23 @@
+# Example board-side config generated from config/tspi-burnin.example.env.
+# The deb package writes /etc/tspi-burnin/config.toml from config/tspi-burnin.env.
+board_id = ""
+server_url = "http://YOUR_SERVER_IP:8080"
+api_token = "change-me"
+
+uplink_interface = "end0"
+require_uplink_interface = true
+wifi_interface = "wlan0"
+bt_controller = "hci0"
+iperf3_port = 5201
+
+heartbeat_interval_sec = 5
+metrics_interval_sec = 5
+log_flush_interval_sec = 2
+command_poll_interval_sec = 2
+command_workers = 2
+
+data_dir = "/var/lib/tspi-burnin"
+max_spool_files = 20000
+request_timeout_sec = 5
+artifact_max_bytes = 262144
+btmon_capture_sec = 4

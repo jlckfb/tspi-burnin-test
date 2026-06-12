@@ -1,0 +1,14 @@
+services:
+  burnin-server:
+    build: .
+    container_name: tspi-burnin-server
+    restart: unless-stopped
+    env_file:
+      - ../config/tspi-burnin.env
+    ports:
+      - "${BURNIN_HTTP_PORT:-8080}:8080"
+    volumes:
+      - burnin-data:/data
+
+volumes:
+  burnin-data:
