@@ -501,7 +501,7 @@ function renderIncidents(incidents) {
 }
 
 function renderEvents(events) {
-  const visible = events.slice(-80).reverse();
+  const visible = events.slice(0, 10);
   setText("event-summary", `显示 ${visible.length} 条`);
   const body = $("events");
   if (!body) return;

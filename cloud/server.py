@@ -1143,7 +1143,7 @@ class Store:
                 for row in self.conn.execute("SELECT data_json FROM results ORDER BY timestamp_ms DESC, id DESC LIMIT 50")
             ]
             events = self.event_rows(
-                self.conn.execute("SELECT * FROM events ORDER BY timestamp_ms DESC, id DESC LIMIT 80").fetchall(),
+                self.conn.execute("SELECT * FROM events ORDER BY timestamp_ms DESC, id DESC LIMIT 10").fetchall(),
                 include_data=False,
             )
             failed_where = "COALESCE(status, 'unknown') != 'passed'"
