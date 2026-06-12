@@ -346,18 +346,18 @@ th {
 
 .overview-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(148px, 1fr));
-  gap: 12px;
+  grid-template-columns: repeat(9, minmax(0, 1fr));
+  gap: 10px;
   margin-bottom: 14px;
 }
 
 .overview-card {
   min-width: 0;
-  min-height: 132px;
+  min-height: 118px;
   display: grid;
   align-content: space-between;
-  gap: 8px;
-  padding: 14px;
+  gap: 7px;
+  padding: 12px;
   border: 2px solid var(--line);
   background: var(--panel);
   box-shadow: var(--shadow);
@@ -376,7 +376,7 @@ th {
   overflow: hidden;
   text-overflow: clip;
   white-space: nowrap;
-  font-size: clamp(24px, 3vw, 36px);
+  font-size: clamp(22px, 2.3vw, 34px);
   line-height: 1;
   font-weight: 800;
   letter-spacing: 0;
@@ -633,6 +633,11 @@ td small {
 
   .summary-strip {
     grid-template-columns: repeat(3, 1fr);
+  }
+
+  .overview-grid {
+    grid-template-columns: repeat(auto-fit, minmax(148px, 1fr));
+    gap: 12px;
   }
 
   .summary-strip span {

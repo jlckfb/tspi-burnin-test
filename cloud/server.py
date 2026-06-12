@@ -30,6 +30,8 @@ class Settings:
     online_timeout_sec = int(os.environ.get("BURNIN_ONLINE_TIMEOUT_SEC", "10"))
     wifi_epoch_sec = int(os.environ.get("BURNIN_WIFI_EPOCH_SEC", "360"))
     wifi_tcp_sec = int(os.environ.get("BURNIN_WIFI_TCP_SEC", "300"))
+    wifi_gap_sec = int(os.environ.get("BURNIN_WIFI_GAP_SEC", "5"))
+    wifi_start_grace_sec = int(os.environ.get("BURNIN_WIFI_START_GRACE_SEC", "8"))
     wifi_tcp_parallel = int(os.environ.get("BURNIN_WIFI_TCP_PARALLEL", "4"))
     wifi_udp_bandwidth = os.environ.get("BURNIN_WIFI_UDP_BANDWIDTH", "0")
     wifi_udp_flood_bandwidth = os.environ.get("BURNIN_WIFI_UDP_FLOOD_BANDWIDTH", "200M")
@@ -141,6 +143,7 @@ def dashboard_result(item: dict[str, Any]) -> dict[str, Any]:
         "bound_dev",
         "iperf3_attempts",
         "iperf3_retry_reason",
+        "iperf3_nonfatal_error",
         "udp_bandwidth",
         "udp_length",
         "adaptive_udp",
@@ -621,6 +624,8 @@ class Store:
         return {
             "wifi_epoch_sec": settings.wifi_epoch_sec,
             "wifi_tcp_sec": settings.wifi_tcp_sec,
+            "wifi_gap_sec": settings.wifi_gap_sec,
+            "wifi_start_grace_sec": settings.wifi_start_grace_sec,
             "wifi_udp_flood_bandwidth": settings.wifi_udp_flood_bandwidth,
             "wifi_udp_small_bandwidth": settings.wifi_udp_small_bandwidth,
             "wifi_udp_large_bandwidth": settings.wifi_udp_large_bandwidth,
@@ -1802,17 +1807,30 @@ def compute_commands(board_id: str) -> list[dict[str, Any]]:
     ids = [board["board_id"] for board in boards]
     if board_id in ids and len(boards) >= 2:
         index = ids.index(board_id)
-        epoch = int(time.time() // settings.wifi_epoch_sec)
+        now_sec = time.time()
+        epoch = int(now_sec // settings.wifi_epoch_sec)
+        epoch_start_sec = epoch * settings.wifi_epoch_sec
+        epoch_end_sec = epoch_start_sec + settings.wifi_epoch_sec
+        elapsed_sec = now_sec - epoch_start_sec
+        remaining_sec = epoch_end_sec - now_sec
         peer = peer_for_epoch(boards, index, epoch)
         mode = wifi_mode_for_epoch(epoch)
-        if peer:
+        should_start_wifi = (
+            elapsed_sec <= max(1, settings.wifi_start_grace_sec)
+            and remaining_sec > max(5, settings.wifi_gap_sec + 5)
+        )
+        if peer and should_start_wifi:
+            duration_sec = min(
+                int(mode.get("duration_sec", max(5, settings.wifi_epoch_sec - settings.wifi_gap_sec))),
+                max(5, int(remaining_sec - max(0, settings.wifi_gap_sec))),
+            )
             command = {
                 "id": f"{mode['type']}-e{epoch}-{board_id}-to-{peer['board_id']}",
                 "type": mode["type"],
                 "peer_board_id": peer["board_id"],
                 "peer_ip": peer["wifi_ip"],
                 "port": settings.iperf3_port,
-                "duration_sec": mode.get("duration_sec", max(5, settings.wifi_epoch_sec - 5)),
+                "duration_sec": duration_sec,
             }
             command.update({key: value for key, value in mode.items() if key not in {"type", "duration_sec"}})
             commands_out.append(command)
@@ -1832,7 +1850,7 @@ def peer_for_epoch(boards: list[dict[str, Any]], index: int, epoch: int) -> dict
 
 
 def wifi_mode_for_epoch(epoch: int) -> dict[str, Any]:
-    epoch_budget = max(5, settings.wifi_epoch_sec - 60)
+    epoch_budget = max(5, settings.wifi_epoch_sec - max(0, settings.wifi_gap_sec))
     duration = max(5, min(settings.wifi_tcp_sec, epoch_budget))
     modes = [
         {"type": "wifi_tcp_single", "duration_sec": duration, "parallel": 1},

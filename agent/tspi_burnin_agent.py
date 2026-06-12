@@ -792,6 +792,7 @@ class CommandRunner:
         self.bt_lock = bt_lock
         self.active: set[str] = set()
         self.active_resources: set[str] = set()
+        self.deferred_notified: set[str] = set()
         self.lock = threading.Lock()
 
     def maybe_start(self, command: dict[str, Any]) -> None:
@@ -803,13 +804,18 @@ class CommandRunner:
             if command_id in self.active or command_id in self.state.completed_commands:
                 return
             if resource and resource in self.active_resources:
-                self._event(
-                    "command_deferred",
-                    command_id=command_id,
-                    severity="warn",
-                    message=f"{resource} resource busy",
-                    data={"command": command, "resource": resource},
-                )
+                defer_key = f"{command_id}:{resource}"
+                if defer_key not in self.deferred_notified:
+                    self.deferred_notified.add(defer_key)
+                    if len(self.deferred_notified) > 2000:
+                        self.deferred_notified = set(list(self.deferred_notified)[-1000:])
+                    self._event(
+                        "command_deferred",
+                        command_id=command_id,
+                        severity="info",
+                        message=f"{resource} resource busy; command deferred",
+                        data={"command": command, "resource": resource},
+                    )
                 return
             if len(self.active) >= int(self.config.get("command_workers", 1)):
                 return
@@ -1106,7 +1112,12 @@ class CommandRunner:
             summary["udp_loss_exceeded"] = bool(final_loss is not None and final_loss > udp_max_loss)
             if summary["udp_loss_exceeded"]:
                 udp_loss_error = f"udp loss {final_loss:.2f}% exceeds {udp_max_loss:.2f}%"
-        status = "passed" if result["ok"] and parsed and not udp_loss_error else "failed"
+        raw_error = str((parsed or {}).get("error") or "") if isinstance(parsed, dict) else ""
+        udp_has_summary = any(summary.get(key) is not None for key in ("bits_per_second", "sent_bits_per_second", "packets"))
+        udp_nonfatal_error = bool(is_udp and raw_error and "server has terminated" in raw_error.lower() and udp_has_summary and not udp_loss_error)
+        if udp_nonfatal_error:
+            summary["iperf3_nonfatal_error"] = raw_error
+        status = "passed" if parsed and not udp_loss_error and (result["ok"] or udp_nonfatal_error) else "failed"
         return {
             "command_id": command.get("id"),
             "type": command_type,
@@ -1118,7 +1129,7 @@ class CommandRunner:
             "preflight": preflight,
             "args": redact_args(args),
             "returncode": result["returncode"],
-            "error": udp_loss_error or ((parsed or {}).get("error") if isinstance(parsed, dict) else ""),
+            "error": "" if status == "passed" else (udp_loss_error or raw_error),
             "stderr": result["stderr"][-4096:],
             "summary": summary,
             "raw": parsed,

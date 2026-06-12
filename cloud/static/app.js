@@ -539,6 +539,7 @@ function renderResults(results, stats = {}) {
           summary.connection_aborted ? "连接中止" : "",
           summary.connect_failed ? "连接失败" : "",
           summary.udp_bandwidth ? `目标 ${summary.udp_bandwidth}` : "",
+          summary.iperf3_nonfatal_error ? `iperf3 ${summary.iperf3_nonfatal_error}` : "",
           summary.adaptive_selected_bandwidth ? `自适应 ${summary.adaptive_selected_bandwidth}` : "",
           summary.udp_length ? `包长 ${summary.udp_length}B` : "",
           summary.duration_sec ? `${summary.duration_sec}秒` : "",
